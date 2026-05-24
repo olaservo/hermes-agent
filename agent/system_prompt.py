@@ -32,6 +32,7 @@ from agent.prompt_builder import (
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
     KANBAN_GUIDANCE,
+    MCP_AS_CODE_GUIDANCE,
     MEMORY_GUIDANCE,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
     PLATFORM_HINTS,
@@ -40,6 +41,36 @@ from agent.prompt_builder import (
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
 )
+
+
+def _should_inject_mcp_as_code(valid_tool_names) -> bool:
+    """Three-gate check for the experimental MCP-as-code prompt nudge.
+
+    Returns True only when ALL of:
+      1. ``execute_code`` is in the session's enabled tools (otherwise the
+         guidance points at an import the model can't use)
+      2. ``code_execution.expose_mcp_tools`` is truthy in config.yaml
+      3. At least one MCP server is connected (otherwise the wrapper
+         imports the guidance recommends resolve to nothing)
+
+    Returns False on any internal failure — the prompt nudge is an
+    enhancement, never a requirement, so a transient import error must
+    never bubble out and break system-prompt assembly.
+    """
+    if "execute_code" not in valid_tool_names:
+        return False
+    try:
+        from tools.code_execution_tool import _load_config
+        if not _load_config().get("expose_mcp_tools"):
+            return False
+    except Exception:
+        return False
+    try:
+        from tools.mcp_tool import _lock, _servers
+        with _lock:
+            return bool(_servers)
+    except Exception:
+        return False
 
 
 def _ra():
@@ -126,6 +157,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if "computer_use" in agent.valid_tool_names:
         from agent.prompt_builder import COMPUTER_USE_GUIDANCE
         stable_parts.append(COMPUTER_USE_GUIDANCE)
+
+    # MCP-as-code guidance — experimental.  See _should_inject_mcp_as_code
+    # for the three-gate logic; keeping it factored out lets tests cover
+    # the gate combinations without spinning up a full system-prompt build.
+    if _should_inject_mcp_as_code(agent.valid_tool_names):
+        stable_parts.append(MCP_AS_CODE_GUIDANCE)
 
     nous_subscription_prompt = _r.build_nous_subscription_prompt(agent.valid_tool_names)
     if nous_subscription_prompt:

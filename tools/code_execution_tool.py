@@ -45,7 +45,7 @@ import time
 import uuid
 
 _IS_WINDOWS = platform.system() == "Windows"
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 # Availability gate.  On Windows we fall back to loopback TCP for the
 # sandbox RPC transport (AF_UNIX is unreliable on Windows Python) — see
@@ -66,6 +66,13 @@ SANDBOX_ALLOWED_TOOLS = frozenset([
     "patch",
     "terminal",
 ])
+
+# Experimental: when ``code_execution.expose_mcp_tools=true``, connected
+# MCP-server tools become importable inside the sandbox as
+# ``from hermes_mcp.<server> import <tool>``.  The RPC dispatch path in
+# this module bypasses ``check_all_command_guards()`` (issues #4146 and
+# #30882), so MCP calls originating from sandbox scripts inherit that
+# bypass.  Keep the flag off in production until those land upstream.
 
 # Resource limit defaults (overridable via config.yaml → code_execution.*)
 DEFAULT_TIMEOUT = 300        # 5 minutes
@@ -260,6 +267,114 @@ def generate_hermes_tools_module(enabled_tools: List[str],
         header = _UDS_TRANSPORT_HEADER
 
     return header + "\n".join(stub_functions)
+
+
+# ---------------------------------------------------------------------------
+# Experimental: MCP-server stubs (opt-in via code_execution.expose_mcp_tools)
+# ---------------------------------------------------------------------------
+
+def _build_mcp_sandbox_bundle(cfg: dict) -> Tuple[Dict[str, str], Set[str]]:
+    """Return ``(files, allowed_names)`` for MCP exposure in the sandbox.
+
+    Walks ``tools.mcp_tool._servers`` under that module's ``_lock`` and
+    emits one Python submodule per connected server, plus a
+    ``hermes_mcp/__init__.py`` that lists the exposed servers in its
+    docstring.  Each generated function dispatches via
+    ``_call("mcp_<server>_<tool>", kwargs)`` — the same name MCP tools
+    are registered under in the Hermes registry
+    (``tools/mcp_tool.py:2833``), so ``handle_function_call`` already
+    routes them without any dispatcher changes.
+
+    Args:
+        cfg: The ``code_execution`` config dict (as returned by
+             ``_load_config``).  Reads ``expose_mcp_tools`` and
+             ``mcp_servers_allowlist``.
+
+    Returns:
+        ``(files, allowed_names)``:
+          - ``files``: dict mapping relative path → file source.  Empty
+            when the feature is disabled or no servers match.
+          - ``allowed_names``: set of ``mcp_<server>_<tool>`` names to
+            add to the RPC dispatch allowlist.
+    """
+    if not cfg.get("expose_mcp_tools"):
+        return {}, set()
+    try:
+        from tools.mcp_tool import (
+            _lock as _mcp_lock,
+            _servers as _mcp_servers,
+            sanitize_mcp_name_component,
+        )
+    except Exception:
+        logger.debug("MCP module unavailable; skipping sandbox bundle", exc_info=True)
+        return {}, set()
+
+    allowlist_raw = cfg.get("mcp_servers_allowlist")
+    allowlist = None
+    if isinstance(allowlist_raw, list):
+        allowlist = {str(name) for name in allowlist_raw}
+
+    files: Dict[str, str] = {}
+    allowed_names: Set[str] = set()
+    server_modules: List[str] = []
+
+    with _mcp_lock:
+        items = list(_mcp_servers.items())
+
+    for server_name, server_task in items:
+        if allowlist is not None and server_name not in allowlist:
+            continue
+        tools = getattr(server_task, "_tools", None) or []
+        if not tools:
+            continue
+        safe_server = sanitize_mcp_name_component(server_name)
+
+        lines: List[str] = [
+            f'"""Auto-generated stubs for MCP server {server_name!r}."""',
+            "from hermes_tools import _call",
+            "",
+        ]
+        emitted = 0
+        for mcp_tool in tools:
+            tool_name = getattr(mcp_tool, "name", None)
+            if not tool_name:
+                continue
+            safe_tool = sanitize_mcp_name_component(tool_name)
+            registry_name = f"mcp_{safe_server}_{safe_tool}"
+            description = (getattr(mcp_tool, "description", "") or "").replace('"""', "''")
+            schema = getattr(mcp_tool, "inputSchema", None)
+            try:
+                schema_json = json.dumps(schema) if schema is not None else "null"
+            except (TypeError, ValueError):
+                schema_json = "null"
+            lines.append(f"def {safe_tool}(**kwargs):")
+            lines.append(f'    """{description}')
+            lines.append("")
+            lines.append(f"    MCP server: {server_name}")
+            lines.append(f"    MCP tool:   {tool_name}")
+            lines.append(f"    Input schema (JSON): {schema_json}")
+            lines.append('    """')
+            lines.append(f"    return _call({registry_name!r}, kwargs)")
+            lines.append("")
+            allowed_names.add(registry_name)
+            emitted += 1
+
+        if emitted == 0:
+            continue
+        files[f"hermes_mcp/{safe_server}.py"] = "\n".join(lines) + "\n"
+        server_modules.append(safe_server)
+
+    if not files:
+        return {}, set()
+
+    init_lines: List[str] = ['"""Auto-generated wrappers for connected MCP servers.', ""]
+    init_lines.append("Available submodules:")
+    for safe in sorted(server_modules):
+        init_lines.append(f"  - hermes_mcp.{safe}")
+    init_lines.append('"""')
+    init_lines.append(f"__all__ = {sorted(server_modules)!r}")
+    files["hermes_mcp/__init__.py"] = "\n".join(init_lines) + "\n"
+    return files, allowed_names
 
 
 # ---- Shared helpers section (embedded in both transport headers) ----------
@@ -904,13 +1019,23 @@ def _execute_remote(
         _ship_file_to_remote(env, f"{sandbox_dir}/hermes_tools.py", tools_src)
         _ship_file_to_remote(env, f"{sandbox_dir}/script.py", code)
 
+        # Experimental: ship hermes_mcp/<server>.py stubs when
+        # code_execution.expose_mcp_tools=true.  See _build_mcp_sandbox_bundle.
+        mcp_files, mcp_allowed_names = _build_mcp_sandbox_bundle(_cfg)
+        for rel_path, content in mcp_files.items():
+            remote_target = f"{sandbox_dir}/{rel_path}"
+            remote_dir = remote_target.rsplit("/", 1)[0]
+            env.execute(f"mkdir -p {shlex.quote(remote_dir)}", cwd="/", timeout=10)
+            _ship_file_to_remote(env, remote_target, content)
+        effective_allowlist = frozenset(sandbox_tools | mcp_allowed_names)
+
         # Start RPC polling thread
         rpc_thread = threading.Thread(
             target=_rpc_poll_loop,
             args=(
                 env, f"{sandbox_dir}/rpc", effective_task_id,
                 tool_call_log, tool_call_counter, max_tool_calls,
-                sandbox_tools, stop_event,
+                effective_allowlist, stop_event,
             ),
             daemon=True,
         )
@@ -1128,6 +1253,18 @@ def execute_code(
         with open(os.path.join(tmpdir, "hermes_tools.py"), "w", encoding="utf-8") as f:
             f.write(tools_src)
 
+        # Experimental: emit hermes_mcp/<server>.py stubs for connected
+        # MCP servers when code_execution.expose_mcp_tools=true.  The MCP
+        # tool names are added to the dispatch allowlist below so the RPC
+        # loop will route them through handle_function_call.
+        mcp_files, mcp_allowed_names = _build_mcp_sandbox_bundle(_cfg)
+        for rel_path, content in mcp_files.items():
+            target = os.path.join(tmpdir, rel_path)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, "w", encoding="utf-8") as f:
+                f.write(content)
+        effective_allowlist = frozenset(sandbox_tools | mcp_allowed_names)
+
         # Write the user's script
         with open(os.path.join(tmpdir, "script.py"), "w", encoding="utf-8") as f:
             f.write(code)
@@ -1156,7 +1293,7 @@ def execute_code(
             target=_rpc_server_loop,
             args=(
                 server_sock, task_id, tool_call_log,
-                tool_call_counter, max_tool_calls, sandbox_tools,
+                tool_call_counter, max_tool_calls, effective_allowlist,
             ),
             daemon=True,
         )
@@ -1198,6 +1335,15 @@ def execute_code(
         # repo-root modules are available to child scripts.  We also prepend
         # the staging tmpdir so ``from hermes_tools import ...`` resolves even
         # when the subprocess CWD is not tmpdir (project mode).
+        #
+        # The stable hermes_mcp/ wrappers (Slice A of
+        # code_execution.expose_mcp_tools) deliberately stay OUT of this
+        # PYTHONPATH: the per-call tmpdir already has a content-identical
+        # copy AND its regular __init__.py shadows the stable copy for
+        # submodule lookup anyway (Python won't merge a regular package
+        # with sibling PYTHONPATH entries).  The stable path's purpose is
+        # between-turn browseability via read_file / search_files, not
+        # in-sandbox imports.
         _hermes_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         _existing_pp = child_env.get("PYTHONPATH", "")
         _pp_parts = [tmpdir, _hermes_root]

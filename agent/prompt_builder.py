@@ -185,6 +185,27 @@ SKILLS_GUIDANCE = (
     "Skills that aren't maintained become liabilities."
 )
 
+# Injected when code_execution.expose_mcp_tools=true AND at least one MCP
+# server is connected AND execute_code is in the session's valid tools.
+# Teaches the model when to prefer the code-mode path over direct MCP tool
+# calls — narrow trigger conditions (batching, filtering, looping) keep
+# one-shot MCP calls on the direct path where they belong.
+MCP_AS_CODE_GUIDANCE = (
+    "# MCP tools as code (experimental)\n"
+    "Connected MCP-server tools are also importable inside execute_code as "
+    "`from hermes_mcp.<server> import <tool>`. Each call goes through the "
+    "same RPC path as the built-in stubs, so intermediate results stay out "
+    "of context — only your script's print() output comes back.\n"
+    "Prefer this code-mode path when you need to: batch multiple MCP calls "
+    "into one turn, filter or transform a large response before showing it, "
+    "or loop over results (paginate, fan-out, fan-in). One-off calls are "
+    "fine to make directly as `mcp_<server>_<tool>` tool calls.\n"
+    "The wrapper catalog lives at `~/.hermes/code-execution/mcp/hermes_mcp/` — "
+    "read_file a server module to see its tools and inputSchemas. The "
+    "auto-generated `mcp-<server>` skills (skills_list / skill_view) index "
+    "each server's tools with read-only / mutating / destructive hints."
+)
+
 KANBAN_GUIDANCE = (
     "# Kanban task execution protocol\n"
     "You have been assigned ONE task from "

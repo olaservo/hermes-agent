@@ -3278,6 +3278,17 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
             summary += f" ({failed} failed)"
         logger.info(summary)
 
+    # Experimental: write stable hermes_mcp/ wrappers + auto-generated
+    # per-server skills for the code-execution-with-MCP feature.  Gated on
+    # code_execution.expose_mcp_tools=true inside; no-op otherwise.  Lazy
+    # import keeps the cycle (mcp_tool → code_execution_tool → mcp_tool)
+    # from biting at module load.
+    try:
+        from tools.mcp_code_discovery import apply_post_discovery_hooks
+        apply_post_discovery_hooks()
+    except Exception:
+        logger.debug("apply_post_discovery_hooks failed", exc_info=True)
+
     return _existing_tool_names()
 
 

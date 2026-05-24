@@ -24,6 +24,7 @@ from agent.prompt_builder import (
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
+    MCP_AS_CODE_GUIDANCE,
     MEMORY_GUIDANCE,
     SESSION_SEARCH_GUIDANCE,
     PLATFORM_HINTS,
@@ -48,6 +49,22 @@ class TestGuidanceConstants:
     def test_session_search_guidance_is_simple_cross_session_recall(self):
         assert "relevant cross-session context exists" in SESSION_SEARCH_GUIDANCE
         assert "recent turns of the current session" not in SESSION_SEARCH_GUIDANCE
+
+    def test_mcp_as_code_guidance_shape(self):
+        """Nuanced posture: triggers on batch/filter/loop, leaves one-offs alone."""
+        # Stays under the 1 KB plan budget — keeps the cached system prompt small.
+        assert len(MCP_AS_CODE_GUIDANCE) < 1024
+        # Anchor on the import surface that the model is being steered toward.
+        assert "from hermes_mcp.<server> import" in MCP_AS_CODE_GUIDANCE
+        # Posture markers (per user direction during planning).
+        assert "batch" in MCP_AS_CODE_GUIDANCE.lower()
+        assert "filter" in MCP_AS_CODE_GUIDANCE.lower()
+        assert "loop" in MCP_AS_CODE_GUIDANCE.lower()
+        assert "one-off" in MCP_AS_CODE_GUIDANCE.lower()
+        # Pointer to the discovery surface from Slice A.
+        assert "~/.hermes/code-execution/mcp" in MCP_AS_CODE_GUIDANCE
+        # Pointer to the auto-generated skills from Slice C.
+        assert "skills_list" in MCP_AS_CODE_GUIDANCE
 
 
 # =========================================================================

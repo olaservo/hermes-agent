@@ -150,7 +150,7 @@ Fallback behavior in `project` mode: if `VIRTUAL_ENV` / `CONDA_PREFIX` is unset,
 Security-critical invariants are identical across both modes:
 
 - environment scrubbing (API keys, tokens, credentials stripped)
-- tool whitelist (scripts cannot call `execute_code` recursively, `delegate_task`, or MCP tools)
+- tool whitelist (scripts cannot call `execute_code` recursively or `delegate_task`; MCP tools require the experimental `expose_mcp_tools` opt-in described below)
 - resource limits (timeout, stdout cap, tool-call cap)
 
 Switching mode changes where scripts run and which interpreter runs them, not what credentials they can see or which tools they can call.
@@ -184,6 +184,91 @@ When your script calls a function like `web_search("query")`:
 4. The function returns the parsed result
 
 This means tool calls inside scripts behave identically to normal tool calls — same rate limits, same error handling, same capabilities. The only restriction is that `terminal()` is foreground-only (no `background` or `pty` parameters).
+
+## Experimental: MCP tools in the sandbox
+
+:::warning Experimental — security caveat
+The RPC dispatch path in `execute_code` does not currently re-apply `check_all_command_guards()` (tracked in upstream issues [#4146](https://github.com/NousResearch/hermes-agent/issues/4146) and [#30882](https://github.com/NousResearch/hermes-agent/issues/30882)). MCP tools called from inside the sandbox inherit that bypass. **Do not enable this in production until those issues land.** It exists today for prototyping the [Code Execution with MCP](https://www.anthropic.com/engineering/code-execution-with-mcp) pattern against a real workload.
+:::
+
+When `code_execution.expose_mcp_tools=true`, Hermes generates a `hermes_mcp/` package alongside `hermes_tools.py` at the start of each `execute_code` call, with one submodule per connected MCP server. Scripts can then import MCP tools as ordinary Python functions:
+
+```python
+from hermes_mcp.github import list_issues, search_code
+
+issues = list_issues(owner="anthropics", repo="claude-code", state="open")
+filtered = [i for i in issues["result"] if "bug" in i.get("title", "").lower()]
+print(len(filtered), "open bug-tagged issues")
+```
+
+The same dispatch path is used as for the built-in seven tools — the generated stub calls back to the parent via RPC, and the parent routes to the existing MCP client. Intermediate MCP responses never enter the LLM context; only the script's `print()` output does.
+
+### Config
+
+```yaml
+# ~/.hermes/config.yaml
+code_execution:
+  expose_mcp_tools: true                 # master switch, default false
+  mcp_servers_allowlist: [github, notion] # optional; omit for all connected servers
+```
+
+| Key | Default | Behavior |
+|-----|---------|----------|
+| `code_execution.expose_mcp_tools` | `false` | Master switch. When `false`, behavior is unchanged. |
+| `code_execution.mcp_servers_allowlist` | `null` | Optional list of server names. When set, only those servers' tools become importable. |
+
+### How stubs are generated
+
+For each connected (and allowlisted) MCP server, a submodule like `hermes_mcp/github.py` is written into the per-call temp dir. Each MCP tool becomes a `**kwargs`-only function whose docstring carries the original description plus the JSON `inputSchema`, so an agent that wants to inspect parameters can call `help(list_issues)`. The stub dispatches via the same registry name the tool is already registered under (`mcp_github_list_issues`), so no new dispatcher code is involved.
+
+### Listing what's available
+
+```python
+import hermes_mcp
+print(hermes_mcp.__all__)
+# ['github', 'notion']
+import hermes_mcp.github
+print([n for n in dir(hermes_mcp.github) if not n.startswith("_")])
+```
+
+### Discovery surface (between turns)
+
+In addition to the per-call sandbox copy, Hermes writes the same wrapper package to a stable path at MCP-discovery time so the agent can browse it between turns with `read_file` / `search_files`:
+
+```
+~/.hermes/code-execution/mcp/hermes_mcp/
+  __init__.py
+  github.py       # one module per connected server, byte-identical to the sandbox copy
+  notion.py
+```
+
+The directory is wiped and regenerated whenever `register_mcp_servers()` runs, so removing a server from `config.yaml` makes its wrapper disappear cleanly on next launch.
+
+### Auto-generated server skills
+
+For each connected MCP server, Hermes also writes a tiny `SKILL.md` under `~/.hermes/skills/mcp-auto/mcp-<server>/` that indexes the server's tools, grouped by a name-prefix heuristic (read-only / mutating / destructive / other). The agent finds these through the normal `skills_list` / `skill_view` flow:
+
+```
+~/.hermes/skills/mcp-auto/         # wiped + regenerated each session
+  mcp-github/
+    SKILL.md          # name: mcp-github
+  mcp-notion/
+    SKILL.md          # name: mcp-notion
+```
+
+User-authored skills under `~/.hermes/skills/<anything-else>/` are never touched.
+
+The heuristic classifies tool names by leading verb (`list_`/`get_`/`search_`/... → read-only; `delete_`/`remove_`/`purge_`/... → destructive; `create_`/`update_`/`patch_`/... → mutating; otherwise → other). Destructive wins ties, so `delete_and_recreate_thing` is flagged destructive rather than mutating.
+
+### Prompt nudge
+
+When all three of the following are true, the system prompt picks up a short `MCP_AS_CODE_GUIDANCE` block:
+
+1. `code_execution.expose_mcp_tools=true`
+2. at least one MCP server is connected
+3. `execute_code` is in the session's enabled tools
+
+The block teaches the model to prefer `import hermes_mcp.<server>` *specifically* when batching, filtering, or looping over MCP results — one-shot calls stay on the direct MCP tool path. Without all three gates met, the prompt is byte-identical to main and the model never sees the block.
 
 ## Error Handling
 

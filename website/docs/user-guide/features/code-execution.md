@@ -270,6 +270,31 @@ When all three of the following are true, the system prompt picks up a short `MC
 
 The block teaches the model to prefer `import hermes_mcp.<server>` *specifically* when batching, filtering, or looping over MCP results — one-shot calls stay on the direct MCP tool path. Without all three gates met, the prompt is byte-identical to main and the model never sees the block.
 
+### Recipe-mode persistence loop
+
+The same prompt block also tells the model to save successful `execute_code` + `hermes_mcp` scripts as skills via the existing `skill_manage(action='create')` tool — turning a one-time win into a reusable recipe the next session picks up automatically through `skills_list` / `skill_view`. The saved script lives in a fenced `python` block inside the recipe skill's `SKILL.md`, alongside a "Use when: …" trigger:
+
+````markdown
+---
+name: gh-bug-issue-triage
+description: "Use when: triaging open bugs in a GitHub repo. Fetches issues, filters by label, sorts by comment count."
+---
+
+# Triage open bugs
+
+```python
+from hermes_mcp.github import list_issues
+issues = list_issues(owner="...", repo="...", state="open", per_page=100)
+bugs = [i for i in issues if any("bug" in l.get("name", "").lower() for l in i.get("labels", []))]
+for i in sorted(bugs, key=lambda x: -x.get("comments", 0))[:10]:
+    print(i["number"], i["title"], i["comments"])
+```
+````
+
+This is the same `skill_manage` surface every Hermes session already uses for procedural memory — the experimental block just makes the bridge from "wrote a useful MCP script today" to "skill_manage that for tomorrow" explicit, without amending the general-purpose `SKILLS_GUIDANCE`. Patching an existing recipe with `skill_manage(action='patch')` is preferred over creating a sibling.
+
+**Not in this release:** the agent cannot yet `import` from a saved recipe's `scripts/` directory inside `execute_code` — the recipe is loaded as text via `skill_view` and the agent re-writes the script into a fresh `execute_code` call. Bridging via PYTHONPATH would let saved skills be imported directly (one fewer turn per reuse) but requires per-skill opt-in and trust gating against hub-installed skills shadowing internal modules; deferred to a future slice.
+
 ## Error Handling
 
 When a script fails, the agent receives structured error information:

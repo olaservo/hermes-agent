@@ -51,9 +51,13 @@ class TestGuidanceConstants:
         assert "recent turns of the current session" not in SESSION_SEARCH_GUIDANCE
 
     def test_mcp_as_code_guidance_shape(self):
-        """Nuanced posture: triggers on batch/filter/loop, leaves one-offs alone."""
-        # Stays under the 1 KB plan budget — keeps the cached system prompt small.
-        assert len(MCP_AS_CODE_GUIDANCE) < 1024
+        """Nuanced posture: triggers on batch/filter/loop, leaves one-offs alone.
+        Plus Slice 3's recipe-mode persistence-loop bridge to skill_manage."""
+        # Budget: under 1500 chars so the system prompt's stable tier stays
+        # cache-friendly.  Slice 3's persistence-loop paragraph pushed past
+        # the original 1024 budget; 1500 matches the KANBAN_GUIDANCE
+        # convention (see tests/tools/test_kanban_tools.py).
+        assert len(MCP_AS_CODE_GUIDANCE) < 1500
         # Anchor on the import surface that the model is being steered toward.
         assert "from hermes_mcp.<server> import" in MCP_AS_CODE_GUIDANCE
         # Posture markers (per user direction during planning).
@@ -65,6 +69,13 @@ class TestGuidanceConstants:
         assert "~/.hermes/code-execution/mcp" in MCP_AS_CODE_GUIDANCE
         # Pointer to the auto-generated skills from Slice C.
         assert "skills_list" in MCP_AS_CODE_GUIDANCE
+        # Slice 3: bridge to the existing skill_manage persistence loop.
+        # The wording can drift, but these tokens pin the load-bearing
+        # parts: the call shape, the trigger framing, the patch-over-
+        # create preference, and the "Use when:" recipe-skill convention.
+        assert "skill_manage(action='create')" in MCP_AS_CODE_GUIDANCE
+        assert "Use when:" in MCP_AS_CODE_GUIDANCE
+        assert "Patching" in MCP_AS_CODE_GUIDANCE
 
 
 # =========================================================================

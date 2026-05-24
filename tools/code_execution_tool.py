@@ -342,17 +342,32 @@ def _build_mcp_sandbox_bundle(cfg: dict) -> Tuple[Dict[str, str], Set[str]]:
             safe_tool = sanitize_mcp_name_component(tool_name)
             registry_name = f"mcp_{safe_server}_{safe_tool}"
             description = (getattr(mcp_tool, "description", "") or "").replace('"""', "''")
-            schema = getattr(mcp_tool, "inputSchema", None)
+            in_schema = getattr(mcp_tool, "inputSchema", None)
             try:
-                schema_json = json.dumps(schema) if schema is not None else "null"
+                in_schema_json = json.dumps(in_schema) if in_schema is not None else "null"
             except (TypeError, ValueError):
-                schema_json = "null"
+                in_schema_json = "null"
+            # outputSchema is increasingly common post-SEP-2106 (JSON Schema
+            # 2020-12 alignment, merged 2026-05).  When present, it tells
+            # the model the response shape — preventing the
+            # ``result[0]`` vs ``result["result"][0]`` guessing game when
+            # Hermes wraps MCP responses (#2421).  Silent no-op for tools
+            # that don't provide one (still common today).
+            out_schema = getattr(mcp_tool, "outputSchema", None)
+            out_schema_json: Optional[str] = None
+            if out_schema is not None:
+                try:
+                    out_schema_json = json.dumps(out_schema)
+                except (TypeError, ValueError):
+                    out_schema_json = None
             lines.append(f"def {safe_tool}(**kwargs):")
             lines.append(f'    """{description}')
             lines.append("")
             lines.append(f"    MCP server: {server_name}")
             lines.append(f"    MCP tool:   {tool_name}")
-            lines.append(f"    Input schema (JSON): {schema_json}")
+            lines.append(f"    Input schema (JSON): {in_schema_json}")
+            if out_schema_json is not None:
+                lines.append(f"    Output schema (JSON): {out_schema_json}")
             lines.append('    """')
             lines.append(f"    return _call({registry_name!r}, kwargs)")
             lines.append("")

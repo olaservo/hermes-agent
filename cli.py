@@ -14608,7 +14608,19 @@ def main(
         cli.show_banner()
         cli.show_toolsets()
         sys.exit(0)
-    
+
+    # MCP tool discovery — running `python cli.py` directly bypasses
+    # hermes_cli/main.py:_prepare_agent_startup, where the canonical
+    # `hermes` binary triggers MCP discovery.  Without this call,
+    # `mcp_servers` configured in config.yaml stay unconnected and the
+    # model's RPC dispatches to `mcp_<server>_<tool>` fail with
+    # "tool not registered".  Cheap no-op when no servers are configured.
+    try:
+        from tools.mcp_tool import discover_mcp_tools
+        discover_mcp_tools()
+    except Exception:
+        logger.debug("MCP tool discovery failed at cli.py startup", exc_info=True)
+
     # Register cleanup for single-query mode (interactive mode registers in run())
     atexit.register(_run_cleanup)
 

@@ -22,6 +22,7 @@ from tools.mcp_code_discovery import (
     STABLE_WRAPPER_SUBDIR,
     _categorize_tool_by_name,
     _render_skill_markdown,
+    _required_args,
     _write_mcp_auto_skills,
     _write_stable_mcp_wrappers,
     apply_post_discovery_hooks,
@@ -46,12 +47,13 @@ def tmp_hermes_home(tmp_path, monkeypatch):
     return tmp_path
 
 
-def _fake_tool(name, description="", input_schema=None):
+def _fake_tool(name, description="", input_schema=None, output_schema=None):
     return SimpleNamespace(
         name=name,
         description=description,
         inputSchema=input_schema if input_schema is not None
         else {"type": "object", "properties": {}},
+        outputSchema=output_schema,
     )
 
 
@@ -226,6 +228,14 @@ class TestWriteMcpAutoSkills:
         example_block = gh.split("## Example", 1)[1]
         # First read-only alphabetically is list_issues
         assert "from hermes_mcp.github import list_issues" in example_block
+        # The example must NOT emit a zero-arg call when the tool requires
+        # args — that would always fail and mislead the model.  The
+        # fake_mcp_servers fixture's tools have no inputSchema with required
+        # args, so list_issues() with empty parens is acceptable AND a
+        # `# tool takes no required args` comment is emitted.  See the
+        # required-args tests below for the schema-driven path.
+        assert "tool takes no required args" in example_block
+        assert "result = list_issues()" in example_block
 
     def test_regenerate_wipes_stale_servers(self, tmp_hermes_home, fake_mcp_servers, monkeypatch):
         _write_mcp_auto_skills({"expose_mcp_tools": True})
@@ -283,12 +293,88 @@ class TestRenderSkillMarkdown:
         # Caller (apply_post_discovery_hooks) is responsible for sanitization,
         # so we exercise _render with already-sanitized inputs.
         md = _render_skill_markdown("my-server", "my_server", {
-            "read": [("get_x", "get_x", "Get X.")],
+            "read": [("get_x", "get_x", "Get X.", [])],
             "mutate": [], "destroy": [], "other": [],
         })
         assert "from hermes_mcp.my_server import get_x" in md
         # Original server name preserved in human-readable header for clarity
         assert "MCP server: my-server" in md
+
+    def test_example_renders_required_args_as_placeholders(self):
+        """Regression for the E2E bug surfaced 2026-05-24: the auto-skill
+        used to emit `result = get_file_contents()` (zero-arg call) for a
+        tool that requires owner/repo/path.  That call always fails and
+        misleads the model.  Required args must come through as
+        ``arg="..."`` placeholders the model can fill in."""
+        md = _render_skill_markdown("github", "github", {
+            "read": [("list_issues", "list_issues", "List issues.",
+                      ["owner", "repo"])],
+            "mutate": [], "destroy": [], "other": [],
+        })
+        example = md.split("## Example", 1)[1]
+        assert 'result = list_issues(owner="...", repo="...")' in example
+        # Should NOT pretend it's a zero-arg call
+        assert "result = list_issues()" not in example
+        # No "no required args" comment when there ARE required args
+        assert "no required args" not in example
+
+    def test_example_with_no_required_args_emits_explanatory_comment(self):
+        md = _render_skill_markdown("noargs", "noargs", {
+            "read": [("ping", "ping", "Ping the server.", [])],
+            "mutate": [], "destroy": [], "other": [],
+        })
+        example = md.split("## Example", 1)[1]
+        assert "tool takes no required args" in example
+        assert "result = ping()" in example
+
+    def test_example_preserves_required_arg_order(self):
+        """Schema's `required` array is the tool author's intended order;
+        keep it stable so the example matches a typical call signature."""
+        md = _render_skill_markdown("ordered", "ordered", {
+            "read": [("call_it", "call_it", "Does a thing.",
+                      ["alpha", "beta", "gamma"])],
+            "mutate": [], "destroy": [], "other": [],
+        })
+        example = md.split("## Example", 1)[1]
+        # alpha must appear before beta, beta before gamma
+        a, b, g = example.find("alpha"), example.find("beta"), example.find("gamma")
+        assert -1 < a < b < g
+
+
+# ---------------------------------------------------------------------------
+# _required_args — schema extraction helper
+# ---------------------------------------------------------------------------
+
+
+class TestRequiredArgs:
+    def test_returns_required_field_when_present(self):
+        tool = _fake_tool("x", input_schema={
+            "type": "object",
+            "properties": {"a": {"type": "string"}, "b": {"type": "string"}},
+            "required": ["a", "b"],
+        })
+        assert _required_args(tool) == ["a", "b"]
+
+    def test_empty_when_required_missing(self):
+        tool = _fake_tool("x", input_schema={
+            "type": "object",
+            "properties": {"a": {"type": "string"}},
+        })
+        assert _required_args(tool) == []
+
+    def test_empty_when_no_input_schema(self):
+        tool = _fake_tool("x", input_schema=None)
+        assert _required_args(tool) == []
+
+    def test_empty_when_required_is_not_a_list(self):
+        # Defensive: a malformed schema with `required: "owner"` (string)
+        # must not crash or include garbage.
+        tool = _fake_tool("x", input_schema={"required": "owner"})
+        assert _required_args(tool) == []
+
+    def test_filters_non_string_entries(self):
+        tool = _fake_tool("x", input_schema={"required": ["a", 42, None, "b"]})
+        assert _required_args(tool) == ["a", "b"]
 
 
 # ---------------------------------------------------------------------------

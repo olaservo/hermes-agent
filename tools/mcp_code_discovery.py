@@ -141,16 +141,37 @@ def auto_skill_root() -> Path:
     return get_hermes_home() / "skills" / AUTO_SKILL_SUBDIR
 
 
+def _required_args(mcp_tool) -> List[str]:
+    """Return the list of required arg names from an MCP tool's inputSchema.
+
+    Empty list when the schema is missing/non-conforming.  The order is
+    preserved from the schema's ``required`` field (JSON Schema convention
+    is to list them in the order the tool expects).
+    """
+    schema = getattr(mcp_tool, "inputSchema", None)
+    if not isinstance(schema, dict):
+        return []
+    required = schema.get("required")
+    if not isinstance(required, list):
+        return []
+    return [str(r) for r in required if isinstance(r, str)]
+
+
 def _bucket_tools(
     server_task,
     sanitize,
-) -> Dict[str, List[Tuple[str, str, str]]]:
+) -> Dict[str, List[Tuple[str, str, str, List[str]]]]:
     """Group a server's tools into (read/mutate/destroy/other) buckets.
 
-    Each bucket entry is ``(safe_tool_name, original_tool_name, description)``.
+    Each bucket entry is
+    ``(safe_tool_name, original_tool_name, description, required_args)``.
+    The ``required_args`` list (empty if none) is plumbed through so the
+    example block can render placeholder kwargs that the model can fill
+    in, rather than a misleading zero-arg call.
+
     Skips tools with falsy names.
     """
-    buckets: Dict[str, List[Tuple[str, str, str]]] = {
+    buckets: Dict[str, List[Tuple[str, str, str, List[str]]]] = {
         "read": [], "mutate": [], "destroy": [], "other": [],
     }
     for mcp_tool in getattr(server_task, "_tools", None) or []:
@@ -162,8 +183,9 @@ def _bucket_tools(
         # First line only — keeps the skill skimmable; full schema is in
         # the wrapper module's docstring (see Slice 1).
         desc_line = desc.splitlines()[0] if desc else ""
+        required = _required_args(mcp_tool)
         category = _categorize_tool_by_name(safe)
-        buckets[category].append((safe, original, desc_line))
+        buckets[category].append((safe, original, desc_line, required))
     for items in buckets.values():
         items.sort()
     return buckets
@@ -172,7 +194,7 @@ def _bucket_tools(
 def _render_skill_markdown(
     server_name: str,
     safe_server: str,
-    buckets: Dict[str, List[Tuple[str, str, str]]],
+    buckets: Dict[str, List[Tuple[str, str, str, List[str]]]],
 ) -> str:
     """Render the SKILL.md text for one MCP server."""
     total = sum(len(v) for v in buckets.values())
@@ -220,7 +242,7 @@ def _render_skill_markdown(
         if not items:
             continue
         lines.append(section_titles[key])
-        for safe_tool, original_tool, desc_line in items:
+        for safe_tool, original_tool, desc_line, _required in items:
             label = safe_tool if safe_tool == original_tool else f"{safe_tool} ({original_tool})"
             if desc_line:
                 lines.append(f"- `{label}` — {desc_line}")
@@ -229,23 +251,38 @@ def _render_skill_markdown(
         lines.append("")
 
     # Best-effort example: pick the first read-only tool if there is one,
-    # else the first tool from any non-empty bucket.
+    # else the first tool from any non-empty bucket.  Render required args
+    # as ``<arg>="..."`` placeholders so the example is a usable template
+    # rather than a misleading zero-arg call that always fails.
     example_tool = None
+    example_required: List[str] = []
     for key in ("read", "other", "mutate", "destroy"):
         if buckets[key]:
-            example_tool = buckets[key][0][0]
+            example_tool, _orig, _desc, example_required = buckets[key][0]
             break
     if example_tool:
-        lines.extend([
+        if example_required:
+            call_args = ", ".join(f'{arg}="..."' for arg in example_required)
+            note_line = ""
+        else:
+            call_args = ""
+            note_line = "# tool takes no required args"
+        call = f"result = {example_tool}({call_args})"
+        example_lines = [
             "## Example",
             "",
             "```python",
             f"from hermes_mcp.{safe_server} import {example_tool}",
-            f"result = {example_tool}()",
+        ]
+        if note_line:
+            example_lines.append(note_line)
+        example_lines.extend([
+            call,
             "print(result)",
             "```",
             "",
         ])
+        lines.extend(example_lines)
 
     return "\n".join(lines)
 

@@ -36,12 +36,18 @@ from tools.code_execution_tool import (  # noqa: E402
 )
 
 
-def _fake_tool(name, description="", input_schema=None):
-    """Build a stand-in for an MCP `Tool` object."""
+def _fake_tool(name, description="", input_schema=None, output_schema=None):
+    """Build a stand-in for an MCP `Tool` object.
+
+    ``output_schema`` defaults to ``None`` (attribute set to None) — mirrors
+    pre-SEP-2106 reality where most servers don't yet emit one.  Pass a
+    dict to simulate a post-SEP server that declares its return shape.
+    """
     return SimpleNamespace(
         name=name,
         description=description,
         inputSchema=input_schema if input_schema is not None else {"type": "object", "properties": {}},
+        outputSchema=output_schema,
     )
 
 
@@ -138,6 +144,72 @@ class TestBuildMcpSandboxBundle:
         # inputSchema embedded as JSON so the LLM can read it via help()
         assert '"owner"' in github_mod
         assert '"required"' in github_mod
+
+    def test_output_schema_embedded_when_server_provides_one(self, monkeypatch):
+        """SEP-2106 enables servers to declare outputSchema (arrays /
+        primitives / compositions, not just object).  When present, embed
+        it so the model knows the response shape — avoids the
+        ``result[0]`` vs ``result["result"][0]`` guessing the E2E hit
+        against the (pre-SEP) github MCP server."""
+        fake = {
+            "demo": _fake_server_task([
+                _fake_tool(
+                    "get_weather_forecast",
+                    description="Hourly forecast.",
+                    output_schema={
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "hour": {"type": "string"},
+                                "temp": {"type": "number"},
+                            },
+                        },
+                    },
+                ),
+            ]),
+        }
+        monkeypatch.setattr("tools.mcp_tool._servers", fake, raising=True)
+        monkeypatch.setattr("tools.mcp_tool._lock", threading.Lock(), raising=True)
+        files, _ = _build_mcp_sandbox_bundle({"expose_mcp_tools": True})
+        mod = files["hermes_mcp/demo.py"]
+        # The docstring must carry the output schema verbatim
+        assert "Output schema (JSON):" in mod
+        assert '"type": "array"' in mod
+        assert '"hour"' in mod
+        # Input schema still there too
+        assert "Input schema (JSON):" in mod
+
+    def test_no_output_schema_line_when_server_omits_it(self, fake_mcp_servers):
+        """Silent degradation: tools without outputSchema (pre-SEP-2106
+        majority today) get stubs without an ``Output schema`` line.  No
+        empty or misleading placeholder."""
+        files, _ = _build_mcp_sandbox_bundle({"expose_mcp_tools": True})
+        github_mod = files["hermes_mcp/github.py"]
+        # fake_mcp_servers fixture's tools don't set output_schema
+        assert "Output schema" not in github_mod
+        # Input schema line is still there
+        assert "Input schema (JSON):" in github_mod
+
+    def test_unserializable_output_schema_falls_back_to_omitting(self, monkeypatch):
+        """A garbage outputSchema (e.g. a circular reference, a custom
+        object) must not crash bundle generation — just skip the line."""
+        class Unserializable:
+            def __repr__(self):
+                return "<unserializable>"
+
+        fake = {
+            "demo": _fake_server_task([
+                _fake_tool("x", output_schema=Unserializable()),
+            ]),
+        }
+        monkeypatch.setattr("tools.mcp_tool._servers", fake, raising=True)
+        monkeypatch.setattr("tools.mcp_tool._lock", threading.Lock(), raising=True)
+        files, _ = _build_mcp_sandbox_bundle({"expose_mcp_tools": True})
+        mod = files["hermes_mcp/demo.py"]
+        # Stub still generated, just without the Output schema line
+        assert "def x(**kwargs):" in mod
+        assert "Output schema" not in mod
 
     def test_allowlist_filters_servers(self, fake_mcp_servers):
         files, names = _build_mcp_sandbox_bundle({

@@ -70,12 +70,26 @@ class TestGuidanceConstants:
         # Pointer to the auto-generated skills from Slice C.
         assert "skills_list" in MCP_AS_CODE_GUIDANCE
         # Slice 3: bridge to the existing skill_manage persistence loop.
-        # The wording can drift, but these tokens pin the load-bearing
-        # parts: the call shape, the trigger framing, the patch-over-
-        # create preference, and the "Use when:" recipe-skill convention.
+        # Empirical E2E run showed Hermes's softer "advisory" voice
+        # wasn't enough for Sonnet 4.6 to act on — pinning bellagio's
+        # load-bearing levers so the wording can't accidentally soften
+        # below the threshold that actually drives behavior:
+        #   1. "not optional" — explicit obligation, not advisory
+        #   2. EITHER (a)/(b)/(c) with an explain-why out — mirrors
+        #      bellagio's exact structure that produced the save-rate
+        #   3. `todo` integration — make it a tracked item so the
+        #      final-summary step doesn't drop it
         assert "skill_manage(action='create')" in MCP_AS_CODE_GUIDANCE
+        assert "skill_manage(action='patch')" in MCP_AS_CODE_GUIDANCE
         assert "Use when:" in MCP_AS_CODE_GUIDANCE
-        assert "Patching" in MCP_AS_CODE_GUIDANCE
+        assert "not optional" in MCP_AS_CODE_GUIDANCE
+        assert "todo" in MCP_AS_CODE_GUIDANCE
+        # The (a)/(b)/(c) escape-valve structure.  Without (c) the model
+        # has no clean way to skip when the script genuinely isn't worth
+        # saving and may just silently drop the obligation.
+        assert "(a)" in MCP_AS_CODE_GUIDANCE
+        assert "(b)" in MCP_AS_CODE_GUIDANCE
+        assert "(c)" in MCP_AS_CODE_GUIDANCE
 
 
 # =========================================================================

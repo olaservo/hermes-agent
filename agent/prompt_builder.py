@@ -208,11 +208,15 @@ MCP_AS_CODE_GUIDANCE = (
     "auto-generated `mcp-<server>` skills (skills_list / skill_view) index "
     "each server's tools with read-only / mutating / destructive hints.\n"
     "When a code-mode script proves useful (5+ MCP calls, a non-trivial "
-    "filter, or anything you'd not want to re-derive), crystallize it via "
-    "`skill_manage(action='create')`: put the working script in a fenced "
-    "```python``` block inside the new SKILL.md with a \"Use when: …\" "
-    "trigger. Patching an existing recipe is preferred over creating a "
-    "sibling."
+    "filter, or anything you'd not want to re-derive), saving it as a "
+    "recipe is **not optional** — code-mode's whole payoff is that the "
+    "second run benefits from the first. After such a task, EITHER "
+    "(a) call `skill_manage(action='create')` with the working script in "
+    "a fenced ```python``` block + a \"Use when: …\" trigger, "
+    "(b) `skill_manage(action='patch')` an existing recipe (preferred "
+    "when one applies), or (c) state in your final summary why neither "
+    "applies. If you're using `todo` for planning, add the skill_manage "
+    "step as a tracked item so it isn't dropped at the end."
 )
 
 KANBAN_GUIDANCE = (

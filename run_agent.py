@@ -1131,6 +1131,54 @@ class AIAgent:
         )
         t = threading.Thread(target=target, daemon=True, name="bg-review")
         t.start()
+        # Track for wait_for_background_reviews() so non-interactive callers
+        # (cli.py -q, mcp_serve one-shot, batch_runner, cron) can join
+        # before process exit.  Without this, the daemon=True thread above
+        # dies on process exit before its first LLM round-trip completes
+        # — silently dropping every skill update the review would have
+        # made.  Interactive mode is fine because the process stays alive
+        # between user inputs and the daemon naturally completes.
+        if not hasattr(self, "_bg_review_threads"):
+            self._bg_review_threads = []
+        self._bg_review_threads.append(t)
+
+    def wait_for_background_reviews(self, timeout_sec: float = 30.0) -> int:
+        """Block until pending background-review threads complete or timeout.
+
+        Args:
+            timeout_sec: Per-call deadline.  All in-flight reviews share
+                the same wall-clock budget; once it elapses the remaining
+                threads are abandoned (their ``daemon=True`` means they
+                die on process exit anyway).  ``<= 0`` means "don't wait."
+
+        Returns:
+            Number of threads that finished before the timeout.
+
+        Safe to call multiple times and from any thread.  Completed
+        threads are pruned from the tracking list so a long-lived agent
+        doesn't accumulate dead ``Thread`` objects.
+        """
+        threads = getattr(self, "_bg_review_threads", None)
+        if not threads or timeout_sec <= 0:
+            if threads:
+                self._bg_review_threads = [t for t in threads if t.is_alive()]
+            return 0
+        import time as _time
+        deadline = _time.monotonic() + timeout_sec
+        completed = 0
+        for t in list(threads):
+            if not t.is_alive():
+                completed += 1
+                continue
+            remaining = deadline - _time.monotonic()
+            if remaining <= 0:
+                break  # budget exhausted; remaining threads stay daemonized
+            t.join(timeout=remaining)
+            if not t.is_alive():
+                completed += 1
+        # Prune dead threads from the tracking list
+        self._bg_review_threads = [t for t in threads if t.is_alive()]
+        return completed
 
     def _build_memory_write_metadata(
         self,

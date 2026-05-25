@@ -51,13 +51,9 @@ class TestGuidanceConstants:
         assert "recent turns of the current session" not in SESSION_SEARCH_GUIDANCE
 
     def test_mcp_as_code_guidance_shape(self):
-        """Nuanced posture: triggers on batch/filter/loop, leaves one-offs alone.
-        Plus Slice 3's recipe-mode persistence-loop bridge to skill_manage."""
-        # Budget: under 1500 chars so the system prompt's stable tier stays
-        # cache-friendly.  Slice 3's persistence-loop paragraph pushed past
-        # the original 1024 budget; 1500 matches the KANBAN_GUIDANCE
-        # convention (see tests/tools/test_kanban_tools.py).
-        assert len(MCP_AS_CODE_GUIDANCE) < 1500
+        """Nuanced posture: triggers on batch/filter/loop, leaves one-offs alone."""
+        # Stays under the 1 KB plan budget — keeps the cached system prompt small.
+        assert len(MCP_AS_CODE_GUIDANCE) < 1024
         # Anchor on the import surface that the model is being steered toward.
         assert "from hermes_mcp.<server> import" in MCP_AS_CODE_GUIDANCE
         # Posture markers (per user direction during planning).
@@ -69,27 +65,6 @@ class TestGuidanceConstants:
         assert "~/.hermes/code-execution/mcp" in MCP_AS_CODE_GUIDANCE
         # Pointer to the auto-generated skills from Slice C.
         assert "skills_list" in MCP_AS_CODE_GUIDANCE
-        # Slice 3: bridge to the existing skill_manage persistence loop.
-        # Empirical E2E run showed Hermes's softer "advisory" voice
-        # wasn't enough for Sonnet 4.6 to act on — pinning bellagio's
-        # load-bearing levers so the wording can't accidentally soften
-        # below the threshold that actually drives behavior:
-        #   1. "not optional" — explicit obligation, not advisory
-        #   2. EITHER (a)/(b)/(c) with an explain-why out — mirrors
-        #      bellagio's exact structure that produced the save-rate
-        #   3. `todo` integration — make it a tracked item so the
-        #      final-summary step doesn't drop it
-        assert "skill_manage(action='create')" in MCP_AS_CODE_GUIDANCE
-        assert "skill_manage(action='patch')" in MCP_AS_CODE_GUIDANCE
-        assert "Use when:" in MCP_AS_CODE_GUIDANCE
-        assert "not optional" in MCP_AS_CODE_GUIDANCE
-        assert "todo" in MCP_AS_CODE_GUIDANCE
-        # The (a)/(b)/(c) escape-valve structure.  Without (c) the model
-        # has no clean way to skip when the script genuinely isn't worth
-        # saving and may just silently drop the obligation.
-        assert "(a)" in MCP_AS_CODE_GUIDANCE
-        assert "(b)" in MCP_AS_CODE_GUIDANCE
-        assert "(c)" in MCP_AS_CODE_GUIDANCE
 
 
 # =========================================================================

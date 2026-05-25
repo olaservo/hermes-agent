@@ -919,6 +919,29 @@ def _run_cleanup():
         return
     _cleanup_done = True
 
+    # Wait for any in-flight background skill/memory review threads BEFORE
+    # tearing down the provider clients, MCP servers, etc.  In `-q` mode
+    # the foreground task often completes in fewer seconds than an LLM
+    # round-trip takes, and the bg-review thread is daemon=True — without
+    # this wait it dies on process exit before its first API call, and
+    # every skill/memory update the review would have made is silently
+    # dropped.  Interactive mode is fine because the process stays alive
+    # between user inputs; this guard mostly matters for -q, mcp_serve
+    # one-shots, batch_runner, and cron.
+    try:
+        if _active_agent_ref is not None and hasattr(
+            _active_agent_ref, "wait_for_background_reviews"
+        ):
+            _timeout = float(
+                os.environ.get("HERMES_BG_REVIEW_TIMEOUT_SEC", "30")
+            )
+            if _timeout > 0:
+                _active_agent_ref.wait_for_background_reviews(
+                    timeout_sec=_timeout
+                )
+    except Exception:
+        logger.debug("background-review join failed", exc_info=True)
+
     try:
         _cleanup_all_terminals()
     except Exception:

@@ -270,30 +270,11 @@ When all three of the following are true, the system prompt picks up a short `MC
 
 The block teaches the model to prefer `import hermes_mcp.<server>` *specifically* when batching, filtering, or looping over MCP results — one-shot calls stay on the direct MCP tool path. Without all three gates met, the prompt is byte-identical to main and the model never sees the block.
 
-### Recipe-mode persistence loop
+### Persistence (recipe-save) is handled out of band
 
-The same prompt block also tells the model to save successful `execute_code` + `hermes_mcp` scripts as skills via the existing `skill_manage(action='create')` tool — turning a one-time win into a reusable recipe the next session picks up automatically through `skills_list` / `skill_view`. The saved script lives in a fenced `python` block inside the recipe skill's `SKILL.md`, alongside a "Use when: …" trigger:
+The reusable-recipe loop — "agent writes a useful `hermes_mcp` script, that script becomes a skill the next session finds" — is handled by Hermes's existing background-review fork (`agent/background_review.py`), **not** by a foreground prompt addition. After every Nth turn (`skills.creation_nudge_interval`, default 10), the main agent spawns a separate AIAgent with a narrowed memory+skill toolset and an aggressive review prompt that proposes skill creates and patches based on the conversation snapshot. The foreground prompt above stops at "use the wrappers when it helps" — what's worth saving is the background review's job to decide.
 
-````markdown
----
-name: gh-bug-issue-triage
-description: "Use when: triaging open bugs in a GitHub repo. Fetches issues, filters by label, sorts by comment count."
----
-
-# Triage open bugs
-
-```python
-from hermes_mcp.github import list_issues
-issues = list_issues(owner="...", repo="...", state="open", per_page=100)
-bugs = [i for i in issues if any("bug" in l.get("name", "").lower() for l in i.get("labels", []))]
-for i in sorted(bugs, key=lambda x: -x.get("comments", 0))[:10]:
-    print(i["number"], i["title"], i["comments"])
-```
-````
-
-This is the same `skill_manage` surface every Hermes session already uses for procedural memory — the experimental block just makes the bridge from "wrote a useful MCP script today" to "skill_manage that for tomorrow" explicit, without amending the general-purpose `SKILLS_GUIDANCE`. Patching an existing recipe with `skill_manage(action='patch')` is preferred over creating a sibling.
-
-**Not in this release:** the agent cannot yet `import` from a saved recipe's `scripts/` directory inside `execute_code` — the recipe is loaded as text via `skill_view` and the agent re-writes the script into a fresh `execute_code` call. Bridging via PYTHONPATH would let saved skills be imported directly (one fewer turn per reuse) but requires per-skill opt-in and trust gating against hub-installed skills shadowing internal modules; deferred to a future slice.
+For non-interactive callers (`cli.py -q`, `mcp_serve`, batch runners, cron) the background review thread is joined on process exit (`HERMES_BG_REVIEW_TIMEOUT_SEC`, default 30) so the review actually completes before the process tears down. See `tools/code_execution_tool.py` and `agent/conversation_loop.py` for details.
 
 ## Error Handling
 

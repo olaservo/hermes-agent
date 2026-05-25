@@ -189,10 +189,14 @@ SKILLS_GUIDANCE = (
 # server is connected AND execute_code is in the session's valid tools.
 # Teaches the model when to prefer the code-mode path over direct MCP tool
 # calls — narrow trigger conditions (batching, filtering, looping) keep
-# one-shot MCP calls on the direct path where they belong.  Closing
-# paragraph bridges to the existing skill_manage persistence loop so the
-# bellagio "save successful code as a skill" pattern fires under the same
-# gate, without amending the always-on SKILLS_GUIDANCE.
+# one-shot MCP calls on the direct path where they belong.
+#
+# Note: an earlier iteration tried to also bolt a "save the script as a
+# skill" obligation onto this block (Slice 3, since reverted).  Empirical
+# E2E plus closer reading of conversation_loop.py revealed that Hermes's
+# load-bearing skill-creation mechanism is the background-review fork
+# (agent/background_review.py), not foreground prompt steering.  Steering
+# the foreground agent toward skill_manage was the wrong layer.
 MCP_AS_CODE_GUIDANCE = (
     "# MCP tools as code (experimental)\n"
     "Connected MCP-server tools are also importable inside execute_code as "
@@ -206,17 +210,7 @@ MCP_AS_CODE_GUIDANCE = (
     "The wrapper catalog lives at `~/.hermes/code-execution/mcp/hermes_mcp/` — "
     "read_file a server module to see its tools and inputSchemas. The "
     "auto-generated `mcp-<server>` skills (skills_list / skill_view) index "
-    "each server's tools with read-only / mutating / destructive hints.\n"
-    "When a code-mode script proves useful (5+ MCP calls, a non-trivial "
-    "filter, or anything you'd not want to re-derive), saving it as a "
-    "recipe is **not optional** — code-mode's whole payoff is that the "
-    "second run benefits from the first. After such a task, EITHER "
-    "(a) call `skill_manage(action='create')` with the working script in "
-    "a fenced ```python``` block + a \"Use when: …\" trigger, "
-    "(b) `skill_manage(action='patch')` an existing recipe (preferred "
-    "when one applies), or (c) state in your final summary why neither "
-    "applies. If you're using `todo` for planning, add the skill_manage "
-    "step as a tracked item so it isn't dropped at the end."
+    "each server's tools with read-only / mutating / destructive hints."
 )
 
 KANBAN_GUIDANCE = (

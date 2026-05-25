@@ -103,7 +103,15 @@ pty = [
   "pywinpty==2.0.15; sys_platform == 'win32'",
 ]
 honcho = ["honcho-ai==2.0.1"]
-mcp = ["mcp==1.26.0"]
+mcp = [
+  "mcp==1.26.0",
+  # JSON Schema 2020-12 validator for code-mode MCP wrappers (see
+  # tools/code_execution_tool.py:_build_mcp_sandbox_bundle).  Drives both
+  # the local input-validation gate in generated wrappers and the
+  # warn-on-mismatch output check.  SEP-2106 aligned MCP tool schemas
+  # to JSON Schema 2020-12, so we need ``Draft202012Validator``.
+  "jsonschema==4.23.0",
+]
 homeassistant = ["aiohttp==3.13.3"]
 sms = ["aiohttp==3.13.3"]
 # Computer use — macOS background desktop control via cua-driver (MCP stdio).

@@ -125,25 +125,41 @@ class TestBuildMcpSandboxBundle:
         assert "__all__" in init
 
     def test_stub_dispatches_to_prefixed_registry_name(self, fake_mcp_servers):
-        """The generated function must _call("mcp_<server>_<tool>", kwargs)
-        — that's the name MCP tools are registered under in the Hermes registry
-        (tools/mcp_tool.py:2833), so handle_function_call routes them
-        without dispatcher changes."""
+        """The generated function must dispatch as ``mcp_<server>_<tool>``
+        — that's the registry name in tools/mcp_tool.py:2833, so
+        handle_function_call routes them without dispatcher changes.
+
+        Post-fidelity-binding rewrite: the signature carries typed params
+        derived from inputSchema, and dispatch goes through a ``_args``
+        dict built from the named params (so jsonschema can validate the
+        full payload before the RPC fires).
+        """
         files, _ = _build_mcp_sandbox_bundle({"expose_mcp_tools": True})
         github_mod = files["hermes_mcp/github.py"]
-        assert "from hermes_tools import _call" in github_mod
-        assert "def list_issues(**kwargs):" in github_mod
-        assert "return _call('mcp_github_list_issues', kwargs)" in github_mod
-        assert "def search_code(**kwargs):" in github_mod
-        assert "return _call('mcp_github_search_code', kwargs)" in github_mod
+        # Server modules now do a multi-line ``from hermes_tools import (...)``
+        # block — assert on the import target rather than the exact form.
+        assert "from hermes_tools import" in github_mod
+        assert "_call," in github_mod
+        # Typed signature: required params positional, optional keyword w/ default.
+        assert "def list_issues(owner: str, repo: str" in github_mod
+        # state is enum on inputSchema → Literal in the signature.
+        assert "Literal['open', 'closed']" in github_mod
+        # Dispatch site uses the prefixed registry name with the validated args.
+        assert "_call('mcp_github_list_issues', _args)" in github_mod
+        # search_code has an empty inputSchema (default fixture) → kwargs-only.
+        assert "def search_code(" in github_mod
+        assert "_call('mcp_github_search_code', _args)" in github_mod
 
     def test_stub_docstring_contains_schema(self, fake_mcp_servers):
         files, _ = _build_mcp_sandbox_bundle({"expose_mcp_tools": True})
         github_mod = files["hermes_mcp/github.py"]
         assert "List issues in a repo." in github_mod
-        # inputSchema embedded as JSON so the LLM can read it via help()
-        assert '"owner"' in github_mod
-        assert '"required"' in github_mod
+        # Schema now lives at module scope as the ``_INPUT_SCHEMA_<tool>``
+        # Python literal that the validator is built from — same bytes,
+        # same read-depth, no docstring duplication.
+        assert "_INPUT_SCHEMA_list_issues" in github_mod
+        assert "'owner'" in github_mod
+        assert "'required'" in github_mod
 
     def test_output_schema_embedded_when_server_provides_one(self, monkeypatch):
         """SEP-2106 enables servers to declare outputSchema (arrays /
@@ -173,23 +189,31 @@ class TestBuildMcpSandboxBundle:
         monkeypatch.setattr("tools.mcp_tool._lock", threading.Lock(), raising=True)
         files, _ = _build_mcp_sandbox_bundle({"expose_mcp_tools": True})
         mod = files["hermes_mcp/demo.py"]
-        # The docstring must carry the output schema verbatim
-        assert "Output schema (JSON):" in mod
-        assert '"type": "array"' in mod
-        assert '"hour"' in mod
-        # Input schema still there too
-        assert "Input schema (JSON):" in mod
+        # Output schema lands at module scope (drives both return-type
+        # rendering and the runtime output validator) — the docstring
+        # carries the human-readable Returns: section, not a JSON blob.
+        assert "_OUTPUT_SCHEMA_get_weather_forecast" in mod
+        assert "_register_output_schema('mcp_demo_get_weather_forecast'" in mod
+        assert "'hour'" in mod
+        # Return annotation reflects the outputSchema (array of objects).
+        assert "-> list[dict[str, Any]]" in mod
+        # Input schema constant also lives at module scope.
+        assert "_INPUT_SCHEMA_get_weather_forecast" in mod
 
-    def test_no_output_schema_line_when_server_omits_it(self, fake_mcp_servers):
+    def test_no_output_validator_when_server_omits_output_schema(self, fake_mcp_servers):
         """Silent degradation: tools without outputSchema (pre-SEP-2106
-        majority today) get stubs without an ``Output schema`` line.  No
-        empty or misleading placeholder."""
+        majority today) get stubs without an output validator
+        registration and without an ``_OUTPUT_SCHEMA_*`` constant.
+        Return annotation falls back to ``Any``."""
         files, _ = _build_mcp_sandbox_bundle({"expose_mcp_tools": True})
         github_mod = files["hermes_mcp/github.py"]
-        # fake_mcp_servers fixture's tools don't set output_schema
-        assert "Output schema" not in github_mod
-        # Input schema line is still there
-        assert "Input schema (JSON):" in github_mod
+        # fake_mcp_servers fixture's tools don't set output_schema.
+        assert "_register_output_schema('mcp_github_list_issues'" not in github_mod
+        assert "_OUTPUT_SCHEMA_list_issues" not in github_mod
+        # Return annotation is honestly ``Any``.
+        assert "-> Any:" in github_mod
+        # Input schema constant still emitted.
+        assert "_INPUT_SCHEMA_list_issues" in github_mod
 
     def test_unserializable_output_schema_falls_back_to_omitting(self, monkeypatch):
         """A garbage outputSchema (e.g. a circular reference, a custom
@@ -207,9 +231,15 @@ class TestBuildMcpSandboxBundle:
         monkeypatch.setattr("tools.mcp_tool._lock", threading.Lock(), raising=True)
         files, _ = _build_mcp_sandbox_bundle({"expose_mcp_tools": True})
         mod = files["hermes_mcp/demo.py"]
-        # Stub still generated, just without the Output schema line
-        assert "def x(**kwargs):" in mod
-        assert "Output schema" not in mod
+        # Stub still generated, just without the output validator
+        # registration (an unserializable schema can't be passed to
+        # ``Draft202012Validator`` at import without taking the whole
+        # module down).
+        assert "def x(" in mod
+        assert "_register_output_schema('mcp_demo_x'" not in mod
+        assert "_OUTPUT_SCHEMA_x" not in mod
+        # Input validator still registered (input schema is fine).
+        assert "_register_input_schema('mcp_demo_x'" in mod
 
     def test_allowlist_filters_servers(self, fake_mcp_servers):
         files, names = _build_mcp_sandbox_bundle({
@@ -248,8 +278,8 @@ class TestBuildMcpSandboxBundle:
         assert "hermes_mcp/my_server.py" in files
         assert names == {"mcp_my_server_do_thing"}
         module_src = files["hermes_mcp/my_server.py"]
-        assert "def do_thing(**kwargs):" in module_src
-        assert "return _call('mcp_my_server_do_thing', kwargs)" in module_src
+        assert "def do_thing(" in module_src
+        assert "_call('mcp_my_server_do_thing', _args)" in module_src
 
     def test_server_with_no_tools_is_skipped(self, monkeypatch):
         fake = {"empty": _fake_server_task([])}
@@ -258,6 +288,227 @@ class TestBuildMcpSandboxBundle:
         files, names = _build_mcp_sandbox_bundle({"expose_mcp_tools": True})
         assert files == {}
         assert names == set()
+
+
+# ---------------------------------------------------------------------------
+# Runtime: exec the generated wrappers and exercise the validation gate.
+# Structural assertions above only check that the right text is emitted.
+# These tests confirm the emitted code actually validates as designed.
+# ---------------------------------------------------------------------------
+
+
+def _exec_generated_module(module_src):
+    """Compile + exec a generated wrapper module against a real hermes_tools.
+
+    Builds the genuine ``hermes_tools.py`` with ``mcp_enabled=True`` so the
+    validator infrastructure (``_validate_input``, ``_register_input_schema``,
+    etc.) is in place — the wrapper module's ``from hermes_tools import ...``
+    line resolves to real implementations.  Returns the module object so
+    callers can rebind ``_call`` on it to script different server responses.
+    """
+    import types
+    from tools.code_execution_tool import generate_hermes_tools_module
+
+    ht_src = generate_hermes_tools_module(
+        enabled_tools=[], transport="uds", mcp_enabled=True
+    )
+    ht = types.ModuleType("hermes_tools")
+    # Provide HERMES_RPC_SOCKET so the (unused) connect helper doesn't KeyError.
+    os.environ.setdefault("HERMES_RPC_SOCKET", "/tmp/_unused")
+    exec(compile(ht_src, "<hermes_tools>", "exec"), ht.__dict__)
+    # Tests never actually round-trip to a real RPC socket — stub _call.
+    ht._call = lambda name, args: None
+    sys.modules["hermes_tools"] = ht
+
+    mod = types.ModuleType("hermes_mcp.test_module")
+    exec(compile(module_src, "<emitted>", "exec"), mod.__dict__)
+    return mod
+
+
+class TestGeneratedWrapperRuntime:
+    """End-to-end: exec the generated wrappers and verify the validators fire."""
+
+    def test_input_validation_catches_wrong_type(self, monkeypatch):
+        fake = {"github": _fake_server_task([
+            _fake_tool(
+                "list_issues",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "owner": {"type": "string"},
+                        "repo":  {"type": "string"},
+                    },
+                    "required": ["owner", "repo"],
+                },
+            ),
+        ])}
+        monkeypatch.setattr("tools.mcp_tool._servers", fake, raising=True)
+        monkeypatch.setattr("tools.mcp_tool._lock", threading.Lock(), raising=True)
+        files, _ = _build_mcp_sandbox_bundle({"expose_mcp_tools": True})
+        mod = _exec_generated_module(files["hermes_mcp/github.py"])
+
+        with pytest.raises(ValueError) as exc_info:
+            mod.list_issues(owner="oct", repo=123)
+        msg = str(exc_info.value)
+        assert "list_issues" in msg
+        assert "repo" in msg
+        assert "string" in msg
+
+    def test_input_validation_enumerates_multiple_failures(self, monkeypatch):
+        fake = {"github": _fake_server_task([
+            _fake_tool(
+                "list_issues",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "owner": {"type": "string"},
+                        "repo":  {"type": "string", "pattern": "^[a-z]+$"},
+                        "state": {"type": "string", "enum": ["open", "closed"]},
+                    },
+                    "required": ["owner", "repo"],
+                },
+            ),
+        ])}
+        monkeypatch.setattr("tools.mcp_tool._servers", fake, raising=True)
+        monkeypatch.setattr("tools.mcp_tool._lock", threading.Lock(), raising=True)
+        files, _ = _build_mcp_sandbox_bundle({"expose_mcp_tools": True})
+        mod = _exec_generated_module(files["hermes_mcp/github.py"])
+
+        # owner: int (bad type), repo: 'BAD' (pattern), state: 'weird' (enum) -
+        # the model should see all three at once so it can correct in one turn.
+        with pytest.raises(ValueError) as exc_info:
+            mod.list_issues(owner=42, repo="BAD", state="weird")
+        msg = str(exc_info.value)
+        for token in ("owner", "repo", "state"):
+            assert token in msg, f"missing field {token} in: {msg}"
+
+    def test_happy_path_passes_validated_args_to_call(self, monkeypatch):
+        fake = {"github": _fake_server_task([
+            _fake_tool(
+                "list_issues",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "owner": {"type": "string"},
+                        "repo":  {"type": "string"},
+                        "state": {"type": "string", "enum": ["open", "closed"]},
+                    },
+                    "required": ["owner", "repo"],
+                },
+            ),
+        ])}
+        monkeypatch.setattr("tools.mcp_tool._servers", fake, raising=True)
+        monkeypatch.setattr("tools.mcp_tool._lock", threading.Lock(), raising=True)
+        files, _ = _build_mcp_sandbox_bundle({"expose_mcp_tools": True})
+        mod = _exec_generated_module(files["hermes_mcp/github.py"])
+
+        captured = []
+        def _spy(name, args):
+            captured.append((name, args))
+            return [{"id": 1}]
+        mod._call = _spy
+
+        result = mod.list_issues(owner="oct", repo="foo", state="open")
+        assert result == [{"id": 1}]
+        assert len(captured) == 1
+        name, args = captured[0]
+        assert name == "mcp_github_list_issues"
+        # None-valued optionals are dropped before validation/dispatch — the
+        # server sees "omitted", which is the JSON Schema idiom for absence.
+        assert args == {"owner": "oct", "repo": "foo", "state": "open"}
+
+    def test_optional_none_dropped_from_dispatch(self, monkeypatch):
+        fake = {"github": _fake_server_task([
+            _fake_tool(
+                "list_issues",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "owner": {"type": "string"},
+                        "labels": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["owner"],
+                },
+            ),
+        ])}
+        monkeypatch.setattr("tools.mcp_tool._servers", fake, raising=True)
+        monkeypatch.setattr("tools.mcp_tool._lock", threading.Lock(), raising=True)
+        files, _ = _build_mcp_sandbox_bundle({"expose_mcp_tools": True})
+        mod = _exec_generated_module(files["hermes_mcp/github.py"])
+
+        captured = []
+        mod._call = lambda n, a: captured.append((n, a)) or None
+        mod.list_issues(owner="oct")  # labels left at default None
+        assert captured[-1][1] == {"owner": "oct"}, captured
+
+    def test_output_validation_warns_but_returns(self, monkeypatch):
+        import warnings
+        fake = {"demo": _fake_server_task([
+            _fake_tool(
+                "fetch",
+                input_schema={"type": "object", "properties": {}},
+                output_schema={
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"id": {"type": "integer"}},
+                        "required": ["id"],
+                    },
+                },
+            ),
+        ])}
+        monkeypatch.setattr("tools.mcp_tool._servers", fake, raising=True)
+        monkeypatch.setattr("tools.mcp_tool._lock", threading.Lock(), raising=True)
+        files, _ = _build_mcp_sandbox_bundle({"expose_mcp_tools": True})
+        mod = _exec_generated_module(files["hermes_mcp/demo.py"])
+
+        # Server returns malformed data — missing required `id` on the item.
+        mod._call = lambda n, a: [{"wrong_key": "no id"}]
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = mod.fetch()
+        # Result still returned — don't punish the model for server drift.
+        assert result == [{"wrong_key": "no id"}]
+        runtime_warnings = [w for w in caught if issubclass(w.category, RuntimeWarning)]
+        assert runtime_warnings, "expected a RuntimeWarning on output drift"
+        msg = str(runtime_warnings[0].message)
+        assert "fetch" in msg
+        assert "id" in msg
+
+    def test_typed_signature_carries_literal_and_optional(self, monkeypatch):
+        """The wrapper's __annotations__ reflect JSON Schema enum/nullability."""
+        import typing
+        fake = {"demo": _fake_server_task([
+            _fake_tool(
+                "act",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "id":   {"type": "string"},
+                        "mode": {"type": "string", "enum": ["one", "two"]},
+                    },
+                    "required": ["id"],
+                },
+            ),
+        ])}
+        monkeypatch.setattr("tools.mcp_tool._servers", fake, raising=True)
+        monkeypatch.setattr("tools.mcp_tool._lock", threading.Lock(), raising=True)
+        files, _ = _build_mcp_sandbox_bundle({"expose_mcp_tools": True})
+        mod = _exec_generated_module(files["hermes_mcp/demo.py"])
+
+        annotations = typing.get_type_hints(mod.act)
+        # Required string param → bare str
+        assert annotations["id"] is str
+        # Optional enum → Optional[Literal[...]] — origin is Union, args
+        # include None and the Literal.
+        mode_t = annotations["mode"]
+        origin = typing.get_origin(mode_t)
+        assert origin is typing.Union
+        args = typing.get_args(mode_t)
+        assert type(None) in args
+        literal_arg = [a for a in args if a is not type(None)][0]
+        assert typing.get_origin(literal_arg) is typing.Literal
+        assert set(typing.get_args(literal_arg)) == {"one", "two"}
 
 
 # ---------------------------------------------------------------------------

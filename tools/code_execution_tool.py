@@ -31,6 +31,7 @@ Remote execution additionally requires Python 3 in the terminal backend.
 import base64
 import functools
 import json
+import keyword as _keyword
 import logging
 import os
 import platform
@@ -40,6 +41,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 import uuid
@@ -235,7 +237,8 @@ _TOOL_STUBS = {
 
 
 def generate_hermes_tools_module(enabled_tools: List[str],
-                                 transport: str = "uds") -> str:
+                                 transport: str = "uds",
+                                 mcp_enabled: bool = False) -> str:
     """
     Build the source code for the hermes_tools.py stub module.
 
@@ -245,6 +248,12 @@ def generate_hermes_tools_module(enabled_tools: List[str],
         enabled_tools: Tool names enabled in the current session.
         transport: ``"uds"`` for Unix domain socket (local backend) or
                    ``"file"`` for file-based RPC (remote backends).
+        mcp_enabled: When True, appends the shared MCP validator
+            infrastructure (jsonschema import, the validator registries,
+            and the ``_validate_input`` / ``_validate_output`` helpers)
+            so generated ``hermes_mcp/<server>.py`` modules don't have to
+            duplicate them.  Keep False when no MCP wrappers will be
+            shipped — avoids pulling jsonschema into the sandbox env.
     """
     tools_to_generate = sorted(SANDBOX_ALLOWED_TOOLS & set(enabled_tools))
 
@@ -266,12 +275,684 @@ def generate_hermes_tools_module(enabled_tools: List[str],
     else:
         header = _UDS_TRANSPORT_HEADER
 
-    return header + "\n".join(stub_functions)
+    body = header + "\n".join(stub_functions)
+    if mcp_enabled:
+        body += _MCP_VALIDATOR_INFRASTRUCTURE
+    return body
+
+
+# Shared MCP validator infrastructure — appended to hermes_tools.py once
+# per execute_code run whenever MCP wrappers are present.  Lets each
+# generated ``hermes_mcp/<server>.py`` module simply
+# ``from hermes_tools import _validate_input, _validate_output,
+# _register_input_schema, _register_output_schema`` instead of carrying
+# its own copy.  Keyed on the full ``mcp_<server>_<tool>`` registry
+# name so two servers with the same short tool name don't collide in
+# the shared dicts.
+_MCP_VALIDATOR_INFRASTRUCTURE = '''
+# ---------------------------------------------------------------------------
+# MCP input/output schema validators (shared across hermes_mcp/<server>.py).
+# ---------------------------------------------------------------------------
+import warnings as _warnings
+import jsonschema as _jsonschema
+
+_INPUT_VALIDATORS = {}
+_OUTPUT_VALIDATORS = {}
+
+
+def _register_input_schema(registry_name, schema):
+    _INPUT_VALIDATORS[registry_name] = _jsonschema.Draft202012Validator(schema)
+
+
+def _register_output_schema(registry_name, schema):
+    _OUTPUT_VALIDATORS[registry_name] = _jsonschema.Draft202012Validator(schema)
+
+
+def _validate_input(registry_name, args):
+    """Raise ValueError listing every input-side schema violation."""
+    v = _INPUT_VALIDATORS.get(registry_name)
+    if v is None:
+        return
+    errors = sorted(v.iter_errors(args), key=lambda e: list(e.absolute_path))
+    if not errors:
+        return
+    lines = [f"MCP tool {registry_name!r} input validation failed:"]
+    for e in errors:
+        path = ".".join(str(p) for p in e.absolute_path) or "(root)"
+        lines.append(f"  - {path}: {e.message}")
+    raise ValueError("\\n".join(lines))
+
+
+def _validate_output(registry_name, result):
+    """Warn (don't raise) on output-side drift — return result unchanged."""
+    v = _OUTPUT_VALIDATORS.get(registry_name)
+    if v is None:
+        return result
+    errors = sorted(v.iter_errors(result), key=lambda e: list(e.absolute_path))
+    if not errors:
+        return result
+    lines = [f"MCP tool {registry_name!r} output does not match its declared schema:"]
+    for e in errors:
+        path = ".".join(str(p) for p in e.absolute_path) or "(root)"
+        lines.append(f"  - {path}: {e.message}")
+    _warnings.warn("\\n".join(lines), RuntimeWarning, stacklevel=3)
+    return result
+'''
 
 
 # ---------------------------------------------------------------------------
 # Experimental: MCP-server stubs (opt-in via code_execution.expose_mcp_tools)
 # ---------------------------------------------------------------------------
+
+# Names we must not shadow in the generated wrapper bodies.  Combined with
+# Python's reserved words, used to filter unsafe parameter names.
+_RESERVED_PY_NAMES: frozenset = (
+    frozenset(_keyword.kwlist)
+    | frozenset(_keyword.softkwlist)
+    | frozenset({"_call", "_args", "_result", "_validate_input",
+                 "_validate_output", "kwargs", "match", "case"})
+)
+
+
+def _is_safe_py_identifier(name: str) -> bool:
+    """Return True if ``name`` is a valid Python identifier that isn't reserved."""
+    return (
+        isinstance(name, str)
+        and name.isidentifier()
+        and name not in _RESERVED_PY_NAMES
+    )
+
+
+def _build_defs_map(schema) -> Dict[str, dict]:
+    """Build a flat ``$defs`` / ``definitions`` lookup table from a schema."""
+    if not isinstance(schema, dict):
+        return {}
+    defs = schema.get("$defs") or schema.get("definitions") or {}
+    return defs if isinstance(defs, dict) else {}
+
+
+def _resolve_local_ref(ref: str, defs: Dict[str, dict]) -> Optional[dict]:
+    """Resolve ``#/$defs/<name>`` or ``#/definitions/<name>`` against ``defs``."""
+    if not isinstance(ref, str):
+        return None
+    for prefix in ("#/$defs/", "#/definitions/"):
+        if ref.startswith(prefix):
+            target = defs.get(ref[len(prefix):])
+            return target if isinstance(target, dict) else None
+    return None
+
+
+def _schema_to_python_hint(
+    node,
+    defs: Dict[str, dict],
+    _seen: Optional[Set[str]] = None,
+) -> str:
+    """Map a JSON Schema 2020-12 node to a Python type-hint expression.
+
+    The returned string is valid Python source assuming
+    ``from typing import Any, Literal, Optional, Union`` is in scope.
+    Falls back to ``Any`` for unresolvable refs, recursive structures, and
+    constructs that have no faithful type-system representation
+    (``allOf``, ``if`` / ``then`` / ``else``).
+    """
+    if _seen is None:
+        _seen = set()
+    if not isinstance(node, dict):
+        return "Any"
+
+    # $ref — resolve once, fall back on recursion.
+    if "$ref" in node:
+        ref = node["$ref"]
+        if ref in _seen:
+            return "Any"
+        resolved = _resolve_local_ref(ref, defs)
+        if resolved is None:
+            return "Any"
+        return _schema_to_python_hint(resolved, defs, _seen | {ref})
+
+    # const / enum → Literal.
+    if "const" in node:
+        return f"Literal[{node['const']!r}]"
+    if "enum" in node:
+        values = node["enum"]
+        if isinstance(values, list) and values:
+            return "Literal[" + ", ".join(repr(v) for v in values) + "]"
+        return "Any"
+
+    # oneOf / anyOf → Union, collapsing the ``null`` arm to Optional.
+    for combinator in ("oneOf", "anyOf"):
+        arms = node.get(combinator)
+        if not isinstance(arms, list) or not arms:
+            continue
+        non_null: List[str] = []
+        has_null = False
+        for arm in arms:
+            if isinstance(arm, dict) and arm.get("type") == "null":
+                has_null = True
+                continue
+            non_null.append(_schema_to_python_hint(arm, defs, _seen))
+        non_null = list(dict.fromkeys(non_null))  # dedupe preserving order
+        if not non_null:
+            return "None"
+        if len(non_null) == 1:
+            return f"Optional[{non_null[0]}]" if has_null else non_null[0]
+        joined = ", ".join(non_null)
+        return f"Union[{joined}, None]" if has_null else f"Union[{joined}]"
+
+    # allOf and conditionals — no faithful single-hint representation.
+    if "allOf" in node or "if" in node or "then" in node or "else" in node:
+        return "Any"
+
+    # ``type`` can be a list (``["string", "null"]`` form).
+    t = node.get("type")
+    if isinstance(t, list):
+        has_null = "null" in t
+        non_null_types = [x for x in t if x != "null"]
+        if not non_null_types:
+            return "None"
+        if len(non_null_types) == 1:
+            inner = _schema_to_python_hint(
+                {**node, "type": non_null_types[0]}, defs, _seen
+            )
+            return f"Optional[{inner}]" if has_null else inner
+        parts = [
+            _schema_to_python_hint({**node, "type": tt}, defs, _seen)
+            for tt in non_null_types
+        ]
+        parts = list(dict.fromkeys(parts))
+        joined = ", ".join(parts)
+        return f"Union[{joined}, None]" if has_null else f"Union[{joined}]"
+
+    if t == "string":
+        return "str"
+    if t == "integer":
+        return "int"
+    if t == "number":
+        return "float"
+    if t == "boolean":
+        return "bool"
+    if t == "null":
+        return "None"
+    if t == "array":
+        items = node.get("items")
+        if items is None:
+            return "list[Any]"
+        return f"list[{_schema_to_python_hint(items, defs, _seen)}]"
+    if t == "object":
+        return "dict[str, Any]"
+
+    return "Any"
+
+
+def _render_field_constraints(node) -> str:
+    """Return a ``(constraint: v, ...)`` suffix for a property node, or ``""``.
+
+    Surfaces per-field constraints the Python type system can't encode, so
+    the model still reads them when scanning the wrapper docstring.
+    """
+    if not isinstance(node, dict):
+        return ""
+    parts: List[str] = []
+    for key in ("pattern", "format"):
+        if key in node:
+            parts.append(f"{key}: {node[key]}")
+    for key in ("minLength", "maxLength",
+                "minimum", "maximum",
+                "exclusiveMinimum", "exclusiveMaximum",
+                "multipleOf",
+                "minItems", "maxItems"):
+        if key in node:
+            parts.append(f"{key}: {node[key]}")
+    if node.get("uniqueItems"):
+        parts.append("uniqueItems")
+    if "default" in node:
+        parts.append(f"default: {node['default']!r}")
+    return f"({', '.join(parts)})" if parts else ""
+
+
+def _render_cross_field_constraints(schema) -> List[str]:
+    """Return bullet strings for object-level constraints.
+
+    These go in the ``Constraints:`` section of the docstring — the rules that
+    cross multiple properties and can't sit next to a single ``Args:`` line.
+    """
+    if not isinstance(schema, dict):
+        return []
+    bullets: List[str] = []
+
+    deps = schema.get("dependentRequired")
+    if isinstance(deps, dict):
+        for trigger, required_others in deps.items():
+            if isinstance(required_others, list) and required_others:
+                tail = ", ".join(f"`{r}`" for r in required_others)
+                bullets.append(
+                    f"When `{trigger}` is provided, {tail} also required."
+                )
+
+    if isinstance(schema.get("dependentSchemas"), dict):
+        bullets.append(
+            "Has `dependentSchemas` — see Input schema (JSON) below for the rules."
+        )
+
+    if "if" in schema:
+        bullets.append(
+            "Conditional shape (`if`/`then`/`else`) — see Input schema (JSON) below."
+        )
+
+    one_of = schema.get("oneOf")
+    if isinstance(one_of, list) and one_of and schema.get("type") == "object":
+        bullets.append(
+            f"One of {len(one_of)} mutually-exclusive shapes "
+            f"(`oneOf` at object level) — see Input schema (JSON)."
+        )
+
+    return bullets
+
+
+def _partition_properties(
+    schema,
+) -> Tuple[List[Tuple[str, str, dict]], List[Tuple[str, str, dict]], bool, bool]:
+    """Split a schema into (required, optional, accepts_kwargs, has_any_props).
+
+    Returns:
+        (required, optional, accepts_kwargs, has_any_props), where each entry
+        in ``required`` / ``optional`` is ``(json_name, py_name, node)``.
+        Properties whose JSON name can't be expressed as a Python identifier
+        are dropped from these lists — they'll still be accepted via
+        ``**kwargs`` and validated at runtime.  ``accepts_kwargs`` is False
+        only when ``additionalProperties: false`` AND every property was
+        py-safe (so the signature can be closed).
+    """
+    if not isinstance(schema, dict):
+        return [], [], True, False
+
+    props = schema.get("properties")
+    if not isinstance(props, dict):
+        return [], [], schema.get("additionalProperties", True) is not False, False
+
+    required_set = set(
+        r for r in (schema.get("required") or []) if isinstance(r, str)
+    )
+
+    required: List[Tuple[str, str, dict]] = []
+    optional: List[Tuple[str, str, dict]] = []
+    used: Set[str] = set()
+    dropped_any = False
+
+    for json_name, node in props.items():
+        if not isinstance(node, dict):
+            node = {}
+        py_name = json_name if _is_safe_py_identifier(json_name) else None
+        if py_name is None and isinstance(json_name, str) and json_name in _RESERVED_PY_NAMES:
+            candidate = json_name + "_"
+            if _is_safe_py_identifier(candidate) and candidate not in used:
+                py_name = candidate
+        if py_name is None or py_name in used:
+            dropped_any = True
+            continue
+        used.add(py_name)
+        entry = (json_name, py_name, node)
+        if json_name in required_set:
+            required.append(entry)
+        else:
+            optional.append(entry)
+
+    accepts_kwargs = schema.get("additionalProperties", True) is not False or dropped_any
+    return required, optional, accepts_kwargs, bool(props)
+
+
+def _emit_signature_params(input_schema) -> Tuple[str, List[Tuple[str, str]]]:
+    """Build the parameter list for the generated def line.
+
+    Returns:
+        ``(signature_string, py_to_json_map)``.  The map preserves the
+        original JSON property names so the wrapper body can rebuild the
+        args dict before validation / dispatch.
+    """
+    defs = _build_defs_map(input_schema)
+    required, optional, accepts_kwargs, _ = _partition_properties(input_schema)
+    py_to_json: List[Tuple[str, str]] = []
+    parts: List[str] = []
+
+    for json_name, py_name, node in required:
+        hint = _schema_to_python_hint(node, defs)
+        parts.append(f"{py_name}: {hint}")
+        py_to_json.append((py_name, json_name))
+
+    for json_name, py_name, node in optional:
+        hint = _schema_to_python_hint(node, defs)
+        # Optional[T] for non-nullable hints; the wrapper body strips
+        # None values before validation, so passing ``state=None`` means
+        # "field omitted" — the JSON Schema idiom for absence.
+        if hint != "Any" and not hint.startswith("Optional["):
+            hint = f"Optional[{hint}]"
+        parts.append(f"{py_name}: {hint} = None")
+        py_to_json.append((py_name, json_name))
+
+    if accepts_kwargs:
+        parts.append("**kwargs")
+
+    return ", ".join(parts), py_to_json
+
+
+def emit_short_signature(input_schema) -> str:
+    """Return a compact ``name: Type, name: Type`` string for the README catalog.
+
+    Lists only the required parameters with their type hints — the README is
+    an index, not a reference, so optional params and defaults are out of
+    scope here.  Reused by ``mcp_code_discovery._render_readme_markdown`` so
+    catalog signatures stay aligned with the generated wrapper signatures.
+    """
+    defs = _build_defs_map(input_schema)
+    required, _, _, _ = _partition_properties(input_schema)
+    parts = [
+        f"{py_name}: {_schema_to_python_hint(node, defs)}"
+        for _, py_name, node in required
+    ]
+    return ", ".join(parts)
+
+
+def _emit_return_hint(output_schema) -> str:
+    """Build the return-type annotation for a tool wrapper.
+
+    ``-> Any`` when no outputSchema was advertised — an explicit ``Any`` is the
+    honest signal that the server didn't promise a shape.
+    """
+    if not isinstance(output_schema, dict):
+        return "Any"
+    defs = _build_defs_map(output_schema)
+    return _schema_to_python_hint(output_schema, defs)
+
+
+def _render_args_section(input_schema) -> List[str]:
+    """Build the ``Args:`` docstring section as a list of indented lines."""
+    if not isinstance(input_schema, dict):
+        return []
+    props = input_schema.get("properties")
+    if not isinstance(props, dict) or not props:
+        return []
+
+    required_set = set(
+        r for r in (input_schema.get("required") or []) if isinstance(r, str)
+    )
+    defs = _build_defs_map(input_schema)
+    lines = ["Args:"]
+    for json_name, node in props.items():
+        if not isinstance(node, dict):
+            node = {}
+        hint = _schema_to_python_hint(node, defs)
+        desc = (node.get("description") or "").strip().splitlines()
+        desc_first = desc[0] if desc else ""
+        constraints = _render_field_constraints(node)
+        req_tag = "" if json_name in required_set else " (optional)"
+        head = f"    {json_name} ({hint}){req_tag}:"
+        trail = " ".join(filter(None, [desc_first, constraints]))
+        lines.append(f"{head} {trail}".rstrip())
+    return lines
+
+
+def _render_returns_section(output_schema) -> List[str]:
+    """Build the ``Returns:`` docstring section — unfolds one level of object shape."""
+    if not isinstance(output_schema, dict):
+        return []
+    defs = _build_defs_map(output_schema)
+    hint = _schema_to_python_hint(output_schema, defs)
+    desc = (output_schema.get("description") or "").strip().splitlines()
+    desc_first = desc[0] if desc else ""
+    constraints = _render_field_constraints(output_schema)
+    head_trail = " ".join(filter(None, [desc_first, constraints]))
+    lines = [f"Returns:", f"    {hint}: {head_trail}".rstrip()]
+
+    # Unfold one level: object → properties, array-of-object → properties.
+    nested = output_schema
+    if output_schema.get("type") == "array":
+        items = output_schema.get("items")
+        if isinstance(items, dict):
+            nested = items
+
+    if isinstance(nested, dict) and isinstance(nested.get("properties"), dict):
+        sub_props = nested["properties"]
+        if sub_props:
+            lines.append("        Fields:")
+            for sub_name, sub_node in sub_props.items():
+                if not isinstance(sub_node, dict):
+                    sub_node = {}
+                sub_hint = _schema_to_python_hint(sub_node, defs)
+                sub_desc = (sub_node.get("description") or "").strip().splitlines()
+                sub_desc_first = sub_desc[0] if sub_desc else ""
+                sub_constraints = _render_field_constraints(sub_node)
+                trailer = " ".join(filter(None, [sub_desc_first, sub_constraints]))
+                lines.append(
+                    f"            {sub_name} ({sub_hint}): {trailer}".rstrip()
+                )
+    return lines
+
+
+def _render_constraints_section(input_schema, output_schema) -> List[str]:
+    """Build the ``Constraints:`` section — cross-field rules from both schemas."""
+    bullets = (
+        _render_cross_field_constraints(input_schema)
+        + _render_cross_field_constraints(output_schema)
+    )
+    if not bullets:
+        return []
+    lines = ["Constraints:"]
+    for b in bullets:
+        lines.append(f"    - {b}")
+    return lines
+
+
+def _render_tool_docstring(
+    description: str,
+    input_schema,
+    output_schema,
+    server_name: str,
+    tool_name: str,
+) -> str:
+    """Build the full multi-section docstring for one generated wrapper.
+
+    Sections (in order):
+      <description>
+      Args:
+      Returns:
+      Constraints:
+      MCP server / tool metadata
+      Input schema (JSON) and Output schema (JSON) fallbacks
+    """
+    parts: List[str] = []
+    desc = (description or "").strip()
+    if desc:
+        parts.append(desc)
+
+    args_lines = _render_args_section(input_schema)
+    if args_lines:
+        if parts:
+            parts.append("")
+        parts.extend(args_lines)
+
+    returns_lines = _render_returns_section(output_schema)
+    if returns_lines:
+        if parts:
+            parts.append("")
+        parts.extend(returns_lines)
+
+    constraint_lines = _render_constraints_section(input_schema, output_schema)
+    if constraint_lines:
+        if parts:
+            parts.append("")
+        parts.extend(constraint_lines)
+
+    if parts:
+        parts.append("")
+    parts.append(f"MCP server: {server_name}")
+    parts.append(f"MCP tool:   {tool_name}")
+    # Machine-readable schema fallback lives at module scope as the
+    # ``_INPUT_SCHEMA_<tool>`` / ``_OUTPUT_SCHEMA_<tool>`` Python literals
+    # the validators are built from — same bytes, same read-depth, no
+    # duplication.  See ``_emit_tool_module``.
+
+    # Escape any embedded triple-quotes that would close the docstring early.
+    text = "\n".join(parts).replace('"""', "''")
+    return text
+
+
+# Per-server module preamble — small now that the validator infrastructure
+# lives in the shared ``hermes_tools`` module.  Just the typing imports and
+# the dispatch / validator function imports.
+_MCP_WRAPPER_HEADER = '''\
+"""Auto-generated stubs for MCP server {server_name!r}.
+
+Function signatures and docstrings are derived from each tool's inputSchema
+/ outputSchema; ``_validate_input`` / ``_validate_output`` (imported from
+``hermes_tools``) enforce the full JSON Schema 2020-12 contract at runtime.
+Input violations raise ``ValueError``; output violations warn via
+``RuntimeWarning`` so call sites stay robust to server drift.
+"""
+from __future__ import annotations
+
+from typing import Any, Literal, Optional, Union
+
+from hermes_tools import (
+    _call,
+    _register_input_schema,
+    _register_output_schema,
+    _validate_input,
+    _validate_output,
+)
+
+
+'''
+
+
+def _emit_tool_module(server_name: str, mcp_tools) -> Tuple[str, Set[str], List[str]]:
+    """Build the source of one ``hermes_mcp/<server>.py`` module.
+
+    Returns ``(source, allowed_names, emitted_tool_names)``.
+    """
+    from tools.mcp_tool import sanitize_mcp_name_component  # local import: avoid cycle
+
+    safe_server = sanitize_mcp_name_component(server_name)
+
+    lines: List[str] = [_MCP_WRAPPER_HEADER.format(server_name=server_name)]
+    allowed_names: Set[str] = set()
+    emitted_tools: List[str] = []
+
+    for mcp_tool in mcp_tools:
+        tool_name = getattr(mcp_tool, "name", None)
+        if not tool_name:
+            continue
+        safe_tool = sanitize_mcp_name_component(tool_name)
+        registry_name = f"mcp_{safe_server}_{safe_tool}"
+
+        description = getattr(mcp_tool, "description", "") or ""
+        input_schema = getattr(mcp_tool, "inputSchema", None)
+        # outputSchema lands here when the server is post-SEP-2106 (JSON
+        # Schema 2020-12 alignment, merged 2026-05).  Carrying it through
+        # gives the model a typed return + runtime drift detection.
+        output_schema = getattr(mcp_tool, "outputSchema", None)
+
+        sig_params, py_to_json = _emit_signature_params(input_schema)
+        return_hint = _emit_return_hint(output_schema)
+        docstring = _render_tool_docstring(
+            description, input_schema, output_schema, server_name, tool_name
+        )
+
+        # The signature line is one Python statement — wrap it so long
+        # generated lines stay readable when the agent reads the file.
+        sig_line = f"def {safe_tool}({sig_params}) -> {return_hint}:"
+
+        # Raw docstring (``r"""..."""``) so regex patterns embedded in
+        # the schema (``\d+``, ``\w*``) don't trip Python's
+        # SyntaxWarning for unknown escape sequences at module import.
+        # Edge case: a raw string can't end in a single backslash —
+        # append a space when it does.
+        safe_doc = docstring.replace("\n", "\n    ")
+        if safe_doc.endswith("\\"):
+            safe_doc += " "
+        body_lines: List[str] = [
+            '    r"""' + safe_doc + '\n    """'
+        ]
+
+        # Build dispatch dict.  Drop None-valued optional params so the
+        # server sees "field omitted" rather than "field provided as null",
+        # matching the JSON Schema 2020-12 idiom for absence.
+        body_lines.append("    _args = {")
+        for py_name, json_name in py_to_json:
+            body_lines.append(f"        {json_name!r}: {py_name},")
+        body_lines.append("    }")
+        body_lines.append("    _args = {_k: _v for _k, _v in _args.items() if _v is not None}")
+        body_lines.append("    _args.update(kwargs)" if "**kwargs" in sig_params else "")
+
+        # Validator lookups key on the full registry name so two servers
+        # with the same short tool name (e.g. github+gitlab both expose
+        # ``list_issues``) don't clobber each other in the shared
+        # hermes_tools validator dicts.
+        body_lines.append(f"    _validate_input({registry_name!r}, _args)")
+        body_lines.append(f"    _result = _call({registry_name!r}, _args)")
+        body_lines.append(f"    return _validate_output({registry_name!r}, _result)")
+
+        # Validator registration at module scope — after the function so
+        # the per-tool schema constants stay grouped with the function.
+        # Skip emission entirely when a schema isn't JSON-serializable
+        # (e.g. a circular reference or a stray object from a misbehaving
+        # server) — passing ``None`` to ``Draft202012Validator`` would
+        # crash at module import and take all sibling tools with it.
+        in_schema_repr = (
+            _safe_python_literal(input_schema)
+            if _is_json_serializable(input_schema)
+            else None
+        )
+        out_schema_repr = (
+            _safe_python_literal(output_schema)
+            if output_schema is not None and _is_json_serializable(output_schema)
+            else None
+        )
+
+        lines.append(sig_line)
+        lines.extend(filter(None, body_lines))
+        lines.append("")
+        if in_schema_repr is not None:
+            lines.append(f"_INPUT_SCHEMA_{safe_tool} = {in_schema_repr}")
+            lines.append(
+                f"_register_input_schema({registry_name!r}, _INPUT_SCHEMA_{safe_tool})"
+            )
+        if out_schema_repr is not None:
+            lines.append(f"_OUTPUT_SCHEMA_{safe_tool} = {out_schema_repr}")
+            lines.append(
+                f"_register_output_schema({registry_name!r}, _OUTPUT_SCHEMA_{safe_tool})"
+            )
+        lines.append("")
+
+        allowed_names.add(registry_name)
+        emitted_tools.append(safe_tool)
+
+    return "\n".join(lines) + "\n", allowed_names, emitted_tools
+
+
+def _is_json_serializable(value) -> bool:
+    """Return True if ``value`` survives a ``json.dumps`` round-trip."""
+    if value is None:
+        return True
+    try:
+        json.dumps(value)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _safe_python_literal(value) -> str:
+    """Render a JSON-Schema-ish value as a Python literal in generated code.
+
+    Caller is expected to have checked ``_is_json_serializable`` first; this
+    helper only handles the happy path.  Round-trips through
+    ``json.dumps`` → ``json.loads`` to coerce non-JSON-native types (tuples,
+    sets) into list/dict form, then uses ``repr`` for stable, parse-safe
+    Python source.
+    """
+    if value is None:
+        return "None"
+    return repr(json.loads(json.dumps(value)))
+
 
 def _build_mcp_sandbox_bundle(cfg: dict) -> Tuple[Dict[str, str], Set[str]]:
     """Return ``(files, allowed_names)`` for MCP exposure in the sandbox.
@@ -329,54 +1010,13 @@ def _build_mcp_sandbox_bundle(cfg: dict) -> Tuple[Dict[str, str], Set[str]]:
             continue
         safe_server = sanitize_mcp_name_component(server_name)
 
-        lines: List[str] = [
-            f'"""Auto-generated stubs for MCP server {server_name!r}."""',
-            "from hermes_tools import _call",
-            "",
-        ]
-        emitted = 0
-        for mcp_tool in tools:
-            tool_name = getattr(mcp_tool, "name", None)
-            if not tool_name:
-                continue
-            safe_tool = sanitize_mcp_name_component(tool_name)
-            registry_name = f"mcp_{safe_server}_{safe_tool}"
-            description = (getattr(mcp_tool, "description", "") or "").replace('"""', "''")
-            in_schema = getattr(mcp_tool, "inputSchema", None)
-            try:
-                in_schema_json = json.dumps(in_schema) if in_schema is not None else "null"
-            except (TypeError, ValueError):
-                in_schema_json = "null"
-            # outputSchema is increasingly common post-SEP-2106 (JSON Schema
-            # 2020-12 alignment, merged 2026-05).  When present, it tells
-            # the model the response shape — preventing the
-            # ``result[0]`` vs ``result["result"][0]`` guessing game when
-            # Hermes wraps MCP responses (#2421).  Silent no-op for tools
-            # that don't provide one (still common today).
-            out_schema = getattr(mcp_tool, "outputSchema", None)
-            out_schema_json: Optional[str] = None
-            if out_schema is not None:
-                try:
-                    out_schema_json = json.dumps(out_schema)
-                except (TypeError, ValueError):
-                    out_schema_json = None
-            lines.append(f"def {safe_tool}(**kwargs):")
-            lines.append(f'    """{description}')
-            lines.append("")
-            lines.append(f"    MCP server: {server_name}")
-            lines.append(f"    MCP tool:   {tool_name}")
-            lines.append(f"    Input schema (JSON): {in_schema_json}")
-            if out_schema_json is not None:
-                lines.append(f"    Output schema (JSON): {out_schema_json}")
-            lines.append('    """')
-            lines.append(f"    return _call({registry_name!r}, kwargs)")
-            lines.append("")
-            allowed_names.add(registry_name)
-            emitted += 1
-
-        if emitted == 0:
+        source, server_allowed, emitted_tools = _emit_tool_module(
+            server_name, tools
+        )
+        if not emitted_tools:
             continue
-        files[f"hermes_mcp/{safe_server}.py"] = "\n".join(lines) + "\n"
+        files[f"hermes_mcp/{safe_server}.py"] = source
+        allowed_names |= server_allowed
         server_modules.append(safe_server)
 
     if not files:
@@ -1027,22 +1667,43 @@ def _execute_remote(
             f"mkdir -p {quoted_rpc_dir}", cwd="/", timeout=10,
         )
 
+        # Experimental: build hermes_mcp/<server>.py stubs first so we know
+        # whether hermes_tools.py needs the shared MCP validator block.
+        # See _build_mcp_sandbox_bundle.
+        mcp_files, mcp_allowed_names = _build_mcp_sandbox_bundle(_cfg)
+
         # Generate and ship files
         tools_src = generate_hermes_tools_module(
-            list(sandbox_tools), transport="file",
+            list(sandbox_tools), transport="file", mcp_enabled=bool(mcp_files),
         )
         _ship_file_to_remote(env, f"{sandbox_dir}/hermes_tools.py", tools_src)
         _ship_file_to_remote(env, f"{sandbox_dir}/script.py", code)
 
-        # Experimental: ship hermes_mcp/<server>.py stubs when
-        # code_execution.expose_mcp_tools=true.  See _build_mcp_sandbox_bundle.
-        mcp_files, mcp_allowed_names = _build_mcp_sandbox_bundle(_cfg)
         for rel_path, content in mcp_files.items():
             remote_target = f"{sandbox_dir}/{rel_path}"
             remote_dir = remote_target.rsplit("/", 1)[0]
             env.execute(f"mkdir -p {shlex.quote(remote_dir)}", cwd="/", timeout=10)
             _ship_file_to_remote(env, remote_target, content)
         effective_allowlist = frozenset(sandbox_tools | mcp_allowed_names)
+
+        # Generated MCP wrappers ``import jsonschema`` for the local
+        # input-validation gate.  Local UDS transport inherits it from the
+        # parent interpreter; remote sandboxes may not have it yet.
+        # Best-effort install — silent success when already present, warning
+        # on failure (the script will surface a clearer ImportError if so).
+        if mcp_files:
+            install_res = env.execute(
+                "python3 -m pip install --quiet --disable-pip-version-check "
+                "'jsonschema>=4.23.0,<5.0.0'",
+                cwd="/", timeout=60,
+            )
+            if install_res.get("returncode", -1) != 0:
+                logger.warning(
+                    "execute_code: could not install jsonschema in remote "
+                    "%s sandbox — MCP wrappers will fail at import. "
+                    "pip output: %s",
+                    env_type, (install_res.get("output", "") or "")[:500],
+                )
 
         # Start RPC polling thread
         rpc_thread = threading.Thread(
@@ -1264,15 +1925,20 @@ def execute_code(
         # Python source files are decoded as UTF-8 by default (PEP 3120).
         # sandbox_tools is already the correct set (intersection with session
         # tools, or SANDBOX_ALLOWED_TOOLS as fallback — see lines above).
-        tools_src = generate_hermes_tools_module(list(sandbox_tools))
+        # Experimental: build hermes_mcp/<server>.py stubs for connected
+        # MCP servers when code_execution.expose_mcp_tools=true.  The MCP
+        # tool names are added to the dispatch allowlist below so the RPC
+        # loop will route them through handle_function_call.  Built first
+        # so hermes_tools.py knows whether to include the shared MCP
+        # validator infrastructure.
+        mcp_files, mcp_allowed_names = _build_mcp_sandbox_bundle(_cfg)
+
+        tools_src = generate_hermes_tools_module(
+            list(sandbox_tools), mcp_enabled=bool(mcp_files),
+        )
         with open(os.path.join(tmpdir, "hermes_tools.py"), "w", encoding="utf-8") as f:
             f.write(tools_src)
 
-        # Experimental: emit hermes_mcp/<server>.py stubs for connected
-        # MCP servers when code_execution.expose_mcp_tools=true.  The MCP
-        # tool names are added to the dispatch allowlist below so the RPC
-        # loop will route them through handle_function_call.
-        mcp_files, mcp_allowed_names = _build_mcp_sandbox_bundle(_cfg)
         for rel_path, content in mcp_files.items():
             target = os.path.join(tmpdir, rel_path)
             os.makedirs(os.path.dirname(target), exist_ok=True)

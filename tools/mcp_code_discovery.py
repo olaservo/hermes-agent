@@ -119,13 +119,22 @@ def _schema_hash(mcp_tool) -> str:
 def _bucket_tools(
     server_task,
     sanitize,
-) -> Dict[str, List[Tuple[str, str, str, List[str]]]]:
+) -> Dict[str, List[Tuple[str, str, str, str]]]:
     """Group a server's tools into (read/mutate/destroy/other) buckets.
 
-    Entry shape: ``(safe_tool_name, original_tool_name, description, required_args)``.
+    Entry shape: ``(safe_tool_name, original_tool_name, description, short_sig)``,
+    where ``short_sig`` is the typed parameter list (e.g. ``"owner: str, repo: str"``)
+    derived from the tool's inputSchema via
+    ``code_execution_tool.emit_short_signature``.  This keeps catalog
+    signatures aligned with the typed wrappers generated for the sandbox.
     Skips tools with falsy names.  Sorted alphabetically within each bucket.
     """
-    buckets: Dict[str, List[Tuple[str, str, str, List[str]]]] = {
+    # Local import: the discovery hook is called at MCP-registration time,
+    # but code_execution_tool itself imports from mcp_tool, so a top-level
+    # import here would risk cycles depending on import order.
+    from tools.code_execution_tool import emit_short_signature
+
+    buckets: Dict[str, List[Tuple[str, str, str, str]]] = {
         "read": [], "mutate": [], "destroy": [], "other": [],
     }
     for mcp_tool in getattr(server_task, "_tools", None) or []:
@@ -135,9 +144,9 @@ def _bucket_tools(
         safe = sanitize(original)
         desc = (getattr(mcp_tool, "description", "") or "").strip()
         desc_line = desc.splitlines()[0] if desc else ""
-        required = _required_args(mcp_tool)
+        short_sig = emit_short_signature(getattr(mcp_tool, "inputSchema", None))
         category = _categorize_tool_by_name(safe)
-        buckets[category].append((safe, original, desc_line, required))
+        buckets[category].append((safe, original, desc_line, short_sig))
     for items in buckets.values():
         items.sort()
     return buckets
@@ -371,14 +380,11 @@ def _render_readme_markdown(
             if not items:
                 continue
             lines.append(section_titles[key])
-            for safe_tool, original_tool, desc_line, required in items:
-                # Render call signature with required args as placeholders so
-                # the model sees the call shape inline rather than having to
-                # cross-reference the wrapper file.
-                if required:
-                    sig = f"{safe_tool}({', '.join(required)})"
-                else:
-                    sig = f"{safe_tool}()"
+            for safe_tool, original_tool, desc_line, short_sig in items:
+                # Render call signature with typed required args so the model
+                # sees the call shape — names AND expected types — inline
+                # rather than having to cross-reference the wrapper file.
+                sig = f"{safe_tool}({short_sig})"
                 label = sig if safe_tool == original_tool else f"{sig} ← {original_tool}"
                 if desc_line:
                     lines.append(f"- `{label}` — {desc_line}")

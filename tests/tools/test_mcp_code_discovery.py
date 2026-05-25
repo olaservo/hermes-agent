@@ -208,8 +208,16 @@ class TestWriteStableMcpWrappers:
         assert (pkg / "__init__.py").is_file()
         assert (pkg / "github.py").is_file()
         gh = (pkg / "github.py").read_text(encoding="utf-8")
-        assert "def list_issues(**kwargs):" in gh
-        assert "from hermes_tools import _call" in gh
+        # Post-fidelity-binding: typed sig with params, not bare **kwargs.
+        assert "def list_issues(owner: str, repo: str" in gh
+        # Server modules import the validator helpers from hermes_tools
+        # (which carries the shared jsonschema infrastructure when
+        # mcp_enabled).
+        assert "from hermes_tools import" in gh
+        assert "_validate_input" in gh
+        # Validator registration lands at module scope, keyed on the full
+        # registry name to avoid cross-server collisions.
+        assert "_register_input_schema('mcp_github_list_issues'" in gh
 
     def test_regenerate_wipes_stale(self, tmp_hermes_home, fake_mcp_servers, monkeypatch):
         _write_stable_mcp_wrappers({"expose_mcp_tools": True})
@@ -267,15 +275,16 @@ class TestWriteWrapperReadme:
         assert "do_weird_thing" in gh_section[other_idx:]
 
     def test_signatures_include_required_args(self, tmp_hermes_home, fake_mcp_servers):
-        """The categorized list shows the call shape inline so the model
-        doesn't have to read the wrapper file to learn required args."""
+        """The categorized list shows the typed call shape inline so the
+        model sees both required args AND expected types without having
+        to open the wrapper file."""
         _write_wrapper_readme({"expose_mcp_tools": True})
         md = _readme_path().read_text(encoding="utf-8")
-        # list_issues has required owner, repo
-        assert "`list_issues(owner, repo)`" in md
-        # create_pull_request has required owner, repo, title
-        assert "`create_pull_request(owner, repo, title)`" in md
-        # search_code (no required args in fixture) → bare parens
+        # list_issues has required owner, repo — both strings in fixture.
+        assert "`list_issues(owner: str, repo: str)`" in md
+        # create_pull_request has required owner, repo, title — all strings.
+        assert "`create_pull_request(owner: str, repo: str, title: str)`" in md
+        # search_code has no required args in fixture → bare parens.
         assert "`search_code()`" in md
 
     def test_header_summarizes_counts(self, tmp_hermes_home, fake_mcp_servers):

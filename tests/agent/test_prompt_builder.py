@@ -61,10 +61,15 @@ class TestGuidanceConstants:
         assert "filter" in MCP_AS_CODE_GUIDANCE.lower()
         assert "loop" in MCP_AS_CODE_GUIDANCE.lower()
         assert "one-off" in MCP_AS_CODE_GUIDANCE.lower()
-        # Pointer to the discovery surface from Slice A.
+        # Pointer to the discovery surface — the wrapper package + the
+        # categorized README inside it.
         assert "~/.hermes/code-execution/mcp" in MCP_AS_CODE_GUIDANCE
-        # Pointer to the auto-generated skills from Slice C.
-        assert "skills_list" in MCP_AS_CODE_GUIDANCE
+        assert "README.md" in MCP_AS_CODE_GUIDANCE
+        # Auto-generated mcp-<server> SKILL pattern was dropped in Slice 4
+        # (awkward two-owner conflict with bg-review patches).  The catalog
+        # now lives in README.md only.  Pin that we don't backslide.
+        assert "skills_list" not in MCP_AS_CODE_GUIDANCE
+        assert "mcp-auto" not in MCP_AS_CODE_GUIDANCE
 
 
 # =========================================================================

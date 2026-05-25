@@ -207,10 +207,11 @@ MCP_AS_CODE_GUIDANCE = (
     "into one turn, filter or transform a large response before showing it, "
     "or loop over results (paginate, fan-out, fan-in). One-off calls are "
     "fine to make directly as `mcp_<server>_<tool>` tool calls.\n"
-    "The wrapper catalog lives at `~/.hermes/code-execution/mcp/hermes_mcp/` — "
-    "read_file a server module to see its tools and inputSchemas. The "
-    "auto-generated `mcp-<server>` skills (skills_list / skill_view) index "
-    "each server's tools with read-only / mutating / destructive hints."
+    "The wrapper package lives at `~/.hermes/code-execution/mcp/hermes_mcp/` — "
+    "start with `README.md` there for the per-server categorized index "
+    "(read-only / mutating / destructive / other, plus a \"Recent changes\" "
+    "section that diffs against the previous launch). Read individual "
+    "`<server>.py` files when you need a tool's full inputSchema."
 )
 
 KANBAN_GUIDANCE = (

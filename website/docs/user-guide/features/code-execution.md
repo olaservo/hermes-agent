@@ -233,32 +233,23 @@ print([n for n in dir(hermes_mcp.github) if not n.startswith("_")])
 
 ### Discovery surface (between turns)
 
-In addition to the per-call sandbox copy, Hermes writes the same wrapper package to a stable path at MCP-discovery time so the agent can browse it between turns with `read_file` / `search_files`:
+In addition to the per-call sandbox copy, Hermes writes the same wrapper package to a stable path at MCP-discovery time, plus a categorized `README.md` inside the package so the agent can browse the catalog without grepping individual `.py` files:
 
 ```
 ~/.hermes/code-execution/mcp/hermes_mcp/
   __init__.py
+  README.md       # categorized catalog (all servers) + "Recent changes" diff
   github.py       # one module per connected server, byte-identical to the sandbox copy
   notion.py
 ```
 
-The directory is wiped and regenerated whenever `register_mcp_servers()` runs, so removing a server from `config.yaml` makes its wrapper disappear cleanly on next launch.
-
-### Auto-generated server skills
-
-For each connected MCP server, Hermes also writes a tiny `SKILL.md` under `~/.hermes/skills/mcp-auto/mcp-<server>/` that indexes the server's tools, grouped by a name-prefix heuristic (read-only / mutating / destructive / other). The agent finds these through the normal `skills_list` / `skill_view` flow:
-
-```
-~/.hermes/skills/mcp-auto/         # wiped + regenerated each session
-  mcp-github/
-    SKILL.md          # name: mcp-github
-  mcp-notion/
-    SKILL.md          # name: mcp-notion
-```
-
-User-authored skills under `~/.hermes/skills/<anything-else>/` are never touched.
+`README.md` is regenerated every time `register_mcp_servers()` runs. It contains a per-server section with tools grouped by a verb-prefix heuristic (read-only / mutating / destructive / other), call signatures with required-arg names rendered inline, and a "Recent changes (since last launch)" section that diffs against a sidecar `.last-catalog.json` manifest — so when an MCP server adds / removes / changes the schema of a tool, the agent sees it on the next launch and can proactively update recipes that depend on it.
 
 The heuristic classifies tool names by leading verb (`list_`/`get_`/`search_`/... → read-only; `delete_`/`remove_`/`purge_`/... → destructive; `create_`/`update_`/`patch_`/... → mutating; otherwise → other). Destructive wins ties, so `delete_and_recreate_thing` is flagged destructive rather than mutating.
+
+The package directory is wiped and regenerated each launch (with the README + manifest preserved across runs for the diff). Removing a server from `config.yaml` makes its wrapper and section in the README disappear cleanly on next launch.
+
+**The skill namespace is left alone.** An earlier iteration of this feature auto-generated one Hermes skill per connected server under `~/.hermes/skills/mcp-auto/`. That created an awkward two-owner conflict — the auto-generated content would clobber any patches the [background-review fork](#persistence-recipe-save-is-handled-out-of-band) made to refine the skill with session-learned gotchas. Slice 4 drops auto-skill generation entirely; on first launch after upgrade, `~/.hermes/skills/mcp-auto/` is removed if present.
 
 ### Prompt nudge
 

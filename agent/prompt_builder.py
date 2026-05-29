@@ -1168,9 +1168,33 @@ def build_skills_system_prompt(
         for name, _desc in cat_skills:
             seen_skill_names.add(name)
 
+    # SEP-2640 provenance: record skill_name → server_name for skills that
+    # came from an MCP server cache dir (~/.hermes/mcp-skills/<server>/...).
+    # Surfaced as a `(via MCP: <server>)` suffix when rendering the index so
+    # the model can tell where remote skills came from. Lazily resolves the
+    # root path so this module doesn't depend on tools.mcp_skills at import.
+    mcp_skill_provenance: dict[str, str] = {}
+    try:
+        from tools.mcp_skills import get_mcp_skills_root
+        _mcp_root_resolved = get_mcp_skills_root().resolve()
+    except Exception:
+        _mcp_root_resolved = None
+
+    def _mcp_server_for_dir(d: "Path") -> "str | None":
+        if _mcp_root_resolved is None:
+            return None
+        try:
+            resolved = d.resolve()
+        except Exception:
+            return None
+        if resolved.parent == _mcp_root_resolved:
+            return resolved.name
+        return None
+
     for ext_dir in external_dirs:
         if not ext_dir.exists():
             continue
+        ext_mcp_server = _mcp_server_for_dir(ext_dir)
         for skill_file in iter_skill_index_files(ext_dir, "SKILL.md"):
             try:
                 is_compatible, frontmatter, desc = _parse_skill_file(skill_file)
@@ -1193,6 +1217,8 @@ def build_skills_system_prompt(
                 skills_by_category.setdefault(entry["category"], []).append(
                     (frontmatter_name, entry["description"])
                 )
+                if ext_mcp_server:
+                    mcp_skill_provenance[frontmatter_name] = ext_mcp_server
             except Exception as e:
                 logger.debug("Error reading external skill %s: %s", skill_file, e)
 
@@ -1226,10 +1252,14 @@ def build_skills_system_prompt(
                 if name in seen:
                     continue
                 seen.add(name)
+                # SEP-2640 provenance suffix lets the model see at a glance
+                # which skills came from a remote MCP server.
+                mcp_origin = mcp_skill_provenance.get(name)
+                suffix = f" (via MCP: {mcp_origin})" if mcp_origin else ""
                 if desc:
-                    index_lines.append(f"    - {name}: {desc}")
+                    index_lines.append(f"    - {name}: {desc}{suffix}")
                 else:
-                    index_lines.append(f"    - {name}")
+                    index_lines.append(f"    - {name}{suffix}")
 
         result = (
             "## Skills (mandatory)\n"

@@ -930,6 +930,11 @@ def _resolve_trust_level(source: str) -> str:
     # user-controlled GitHub identifiers such as "official/<repo>".
     if normalized_source == "official":
         return "builtin"
+    # SEP-2640 skills served by an MCP server the user already opted into:
+    # treated as `trusted` (caution allowed, dangerous blocked). Source is
+    # always "mcp/<server-name>".
+    if normalized_source == "mcp" or normalized_source.startswith("mcp/"):
+        return "trusted"
     # Check if source matches any trusted repo exactly, or a skill path inside
     # that repo. Do not trust sibling repositories that merely share a prefix.
     for trusted in TRUSTED_REPOS:

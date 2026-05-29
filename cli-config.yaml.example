@@ -812,6 +812,27 @@ platform_toolsets:
 #       max_tool_rounds: 5      # tool loop limit (0 = disable)
 #       log_level: "info"       # audit verbosity
 
+# ─── MCP Skills Extension (SEP-2640) ────────────────────────────────────────
+# Consume Agent Skills served by MCP servers that advertise the
+# `io.modelcontextprotocol/skills` capability. When enabled, Hermes reads
+# the server's `skill://index.json` resource on connect, fetches each
+# SKILL.md via `resources/read`, materializes the skill under
+# ~/.hermes/mcp-skills/<server>/<skill>/, scans it with skills_guard at the
+# `trusted` tier, and exposes it through the normal skill discovery path.
+#
+# Off by default — the SEP is on a feature branch and the on-wire shapes may
+# still change. Flip to `experimental` to opt in.
+#
+# mcp:
+#   skills_extension: experimental   # off | experimental
+#
+# Disable a specific server's skills without removing the server (skills
+# from this server are excluded from discovery; the server's tools stay):
+#
+# skills:
+#   disabled_mcp_servers:
+#     - serverA
+
 # =============================================================================
 # Voice Transcription (Speech-to-Text)
 # =============================================================================

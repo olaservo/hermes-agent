@@ -324,13 +324,70 @@ def get_external_skills_dirs() -> List[Path]:
     return result
 
 
-def get_all_skills_dirs() -> List[Path]:
-    """Return all skill directories: local ``~/.hermes/skills/`` first, then external.
+def get_mcp_skills_dirs() -> List[Path]:
+    """Return per-server skill roots materialized under ``~/.hermes/mcp-skills/``.
 
-    The local dir is always first (and always included even if it doesn't exist
-    yet — callers handle that).  External dirs follow in config order.
+    Each entry is a directory like ``~/.hermes/mcp-skills/<safe-server>/``
+    populated by ``tools.mcp_skills.discover_and_materialize`` when the
+    paired MCP server advertises SEP-2640 and the ``mcp.skills_extension``
+    flag is on.
+
+    Lazily imports ``tools.mcp_skills`` so this module stays free of MCP
+    dependencies for callers that never touch the feature.
+    """
+    try:
+        from tools.mcp_skills import iter_mcp_server_dirs
+    except Exception:
+        return []
+    try:
+        return iter_mcp_server_dirs()
+    except Exception as exc:
+        logger.debug("Could not enumerate MCP skill dirs: %s", exc)
+        return []
+
+
+def get_disabled_mcp_servers() -> Set[str]:
+    """Return MCP server names whose skills should be skipped in discovery.
+
+    Read from ``skills.disabled_mcp_servers`` in ``config.yaml``. Lets a
+    user keep an MCP server's tools while suppressing its skills (or
+    vice versa: keep the server enabled for skills but exclude individual
+    skills via the existing ``skills.disabled`` list).
+    """
+    config_path = get_config_path()
+    if not config_path.exists():
+        return set()
+    try:
+        parsed = yaml_load(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return set()
+    if not isinstance(parsed, dict):
+        return set()
+    skills_cfg = parsed.get("skills")
+    if not isinstance(skills_cfg, dict):
+        return set()
+    return _normalize_string_set(skills_cfg.get("disabled_mcp_servers"))
+
+
+def get_all_skills_dirs() -> List[Path]:
+    """Return all skill directories: local first, MCP-served next, external last.
+
+    Order matters for collision precedence: when two dirs ship a skill with
+    the same name, the earlier entry wins. Local ``~/.hermes/skills/``
+    (bundled + hub-installed + agent-created) always wins; MCP-served roots
+    take precedence over user-configured ``external_dirs`` so a server can
+    deliberately override an external sibling without filesystem editing.
+
+    The local dir is always included even if it doesn't exist yet — callers
+    handle that. MCP and external dirs are only included when they exist.
+    Servers listed in ``skills.disabled_mcp_servers`` are excluded.
     """
     dirs = [get_skills_dir()]
+    disabled_servers = get_disabled_mcp_servers()
+    for mcp_dir in get_mcp_skills_dirs():
+        if mcp_dir.name in disabled_servers:
+            continue
+        dirs.append(mcp_dir)
     dirs.extend(get_external_skills_dirs())
     return dirs
 

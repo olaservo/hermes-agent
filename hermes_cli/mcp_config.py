@@ -464,6 +464,16 @@ def cmd_mcp_remove(args):
     except Exception:
         pass
 
+    # SEP-2640: drop any materialized skills this server provided so they
+    # stop appearing in the skill index. Independent of OAuth cleanup so a
+    # cache without a matching token (or vice versa) still gets reaped.
+    try:
+        from tools.mcp_skills import cleanup_for_server
+        if cleanup_for_server(name):
+            _success("Removed cached MCP-served skills")
+    except Exception:
+        pass
+
 
 # ─── hermes mcp list ──────────────────────────────────────────────────────────
 

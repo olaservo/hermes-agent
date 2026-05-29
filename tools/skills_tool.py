@@ -1103,6 +1103,30 @@ def skill_view(
                     },
                     ensure_ascii=False,
                 )
+
+            # SEP-2640 lazy fetch: when the skill was materialized from an
+            # MCP server, supporting files (scripts/, references/, ...) aren't
+            # pre-downloaded — fetch on first read so we don't pay the bandwidth
+            # for files the model never asks about. Returns None when this
+            # isn't an MCP-backed skill or the file is already on disk; an
+            # error string otherwise.
+            if not target_file.exists():
+                try:
+                    from tools.mcp_skills import ensure_mcp_skill_file_present
+                    fetch_outcome = ensure_mcp_skill_file_present(skill_dir, file_path)
+                except Exception:
+                    fetch_outcome = None
+                if isinstance(fetch_outcome, str) and fetch_outcome.startswith("blocked"):
+                    return json.dumps(
+                        {
+                            "success": False,
+                            "error": (
+                                f"File '{file_path}' in skill '{name}' was refused by "
+                                f"the security scanner ({fetch_outcome})."
+                            ),
+                        },
+                        ensure_ascii=False,
+                    )
             if not target_file.exists():
                 # List available files in the skill directory, organized by type
                 available_files = {

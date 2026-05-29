@@ -1169,6 +1169,32 @@ class MCPServerTask:
         task.add_done_callback(self._pending_refresh_tasks.discard)
         return task
 
+    async def _refresh_skills_task(self):
+        """Run a SEP-2640 skills refresh, swallowing transient failures.
+
+        Called from the resources/list_changed notification handler. Mirrors
+        ``_refresh_tools_task``: failures are logged but don't crash the task
+        managing the MCP session.
+        """
+        try:
+            from tools.mcp_skills import refresh_for_server
+            await refresh_for_server(self, self.name)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("MCP server '%s': dynamic skills refresh failed", self.name)
+
+    def _schedule_skills_refresh(self) -> asyncio.Task:
+        """Schedule a background MCP-served-skills refresh.
+
+        Strong-references the task in ``_pending_refresh_tasks`` so it
+        survives until completion even if the caller doesn't await it.
+        """
+        task = asyncio.create_task(self._refresh_skills_task())
+        self._pending_refresh_tasks.add(task)
+        task.add_done_callback(self._pending_refresh_tasks.discard)
+        return task
+
     def _make_message_handler(self):
         """Build a ``message_handler`` callback for ``ClientSession``.
 
@@ -1205,7 +1231,18 @@ class MCPServerTask:
                         case PromptListChangedNotification():
                             logger.debug("MCP server '%s': prompts/list_changed (ignored)", self.name)
                         case ResourceListChangedNotification():
-                            logger.debug("MCP server '%s': resources/list_changed (ignored)", self.name)
+                            # SEP-2640: skills are served as resources. A
+                            # resources/list_changed event is the upstream
+                            # signal that the skill set may have shifted —
+                            # re-run discovery in a background task so the
+                            # notification handler returns promptly (same
+                            # rationale as the tools/list_changed branch).
+                            logger.info(
+                                "MCP server '%s': received resources/list_changed notification",
+                                self.name,
+                            )
+                            self._schedule_skills_refresh()
+                            await asyncio.sleep(0)
                         case _:
                             pass
             except Exception:
@@ -3349,6 +3386,20 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
         name, transport_type, len(registered_names),
         ", ".join(registered_names),
     )
+
+    # SEP-2640: if the server advertises the skills extension and the
+    # mcp.skills_extension feature flag is on, fetch its index, materialize
+    # SKILL.md files under ~/.hermes/mcp-skills/<server>/, and let the
+    # existing skill discovery pipeline pick them up. Failures here are
+    # logged but do not fail the server's tool registration.
+    try:
+        from tools.mcp_skills import discover_and_materialize
+        await discover_and_materialize(server, name)
+    except Exception:
+        logger.exception(
+            "MCP server '%s': SEP-2640 skill discovery failed", name,
+        )
+
     return registered_names
 
 
